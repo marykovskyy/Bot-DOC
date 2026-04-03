@@ -1,0 +1,10 @@
+{
+  "pythonVersion": "3.11",
+  "typeCheckingMode": "basic",
+  "reportMissingModuleSource": "none",
+  "reportAttributeAccessIssue": "none",
+  "reportGeneralTypeIssues": "none",
+  "ignore": [
+    "scraper.py"
+  ]
+}

@@ -1,0 +1,37 @@
+# Секрети — НІКОЛИ не мають потрапляти в git
+token.env
+.env
+credentials.json
+proxy_settings.py
+.env.example
+
+# Локальні дані
+companies.db
+uk_reports/
+turkey_reports/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Тимчасові файли браузера
+dp_proxy_plugin_*/
+buster_ext/
+
+# Результати і звіти
+results/
+*.xlsx
+*.txt
+
+# Шаблони документів (PSD і PNG)
+templates/
+*.psd
+
+# Claude
+.claude/
+
+# Логи
+*.log
