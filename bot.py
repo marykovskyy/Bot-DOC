@@ -20,39 +20,39 @@ from telegram.ext import (
 from config import TOKEN
 import database
 from state import _scheduler
-from ai_sorter import (
+from analysis.ai_sorter import (
     handle_zip_documents, handle_gdrive_link, cmd_myresults,
     handle_delivery_callback, cancel_analysis_callback, cmd_analysis_logs,
     cmd_cleanup, run_auto_cleanup,
 )
 
 # ── Handlers ──
-from handlers_scraping import (
+from handlers.scraping import (
     start, site_choice, save_kw, save_count, save_year,
     select_uk_mode, run_task, stop_scraping, status_updater,
     repeat_search_callback, handle_navigation,
 )
-from handlers_proxy import (
+from handlers.proxy import (
     proxy_menu, proxy_callback_handler, auto_update_proxy,
     handle_proxy_file, prompt_for_zip,
 )
-from handlers_admin import (
+from handlers.admin import (
     is_admin, require_auth,
     show_stats, show_help, help_section_callback,
     cmd_users, cmd_adduser, cmd_removeuser,
     cmd_history, repeat_from_history,
 )
-from handlers_schedule import (
+from handlers.schedule import (
     cmd_schedule, handle_schedule_callback,
     _load_scheduled_tasks, cmd_digest,
 )
-from handlers_misc import (
+from handlers.misc import (
     start_health_server, show_bot_status, restart_bot,
 )
-from handlers_documents import (
+from handlers.documents import (
     build_doc_conversation, cmd_preview_template,
 )
-from document_generator import load_all_templates
+from documents.generator import load_all_templates
 from state import (
     SELECT_SITE, TYPING_KEYWORD, TYPING_COUNT,
     TYPING_YEAR, SELECT_FORMAT, SELECT_UK_MODE,
@@ -179,6 +179,11 @@ def main() -> None:
         await run_auto_cleanup()
         logger.info("Auto-cleanup завершено.")
         load_all_templates()  # Завантажуємо шаблони документів з templates/
+
+        # Прогрів PaddleOCR — завантажує моделі заздалегідь (~10с)
+        import asyncio
+        from analysis.doc_analyzer import warmup_paddle_ocr
+        await asyncio.to_thread(warmup_paddle_ocr)
 
     app.post_init = post_init  # type: ignore[method-assign]
     logger.info("🤖 Бот запущений!")

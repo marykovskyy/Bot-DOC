@@ -8,7 +8,7 @@ from telegram.ext import ContextTypes, ConversationHandler
 
 import database
 from config import ADMIN_ID
-from scraper import run_scraping
+from scrapers.main import run_scraping
 from state import (
     scraping_status, _status_lock, MAX_PARALLEL_TASKS,
     SELECT_SITE, TYPING_KEYWORD, TYPING_COUNT, TYPING_YEAR, SELECT_FORMAT, SELECT_UK_MODE

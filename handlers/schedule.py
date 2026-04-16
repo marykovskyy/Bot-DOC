@@ -15,7 +15,7 @@ from telegram.ext import ContextTypes
 from apscheduler.triggers.cron import CronTrigger
 
 import database
-from scraper import run_scraping
+from scrapers.main import run_scraping
 from state import scraping_status, _status_lock, _scheduler, _BOT_TZ
 
 logger = logging.getLogger(__name__)

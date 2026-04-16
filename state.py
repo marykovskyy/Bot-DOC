@@ -4,6 +4,8 @@ import os
 from dotenv import load_dotenv
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
+from constants import MAX_PARALLEL_TASKS  # noqa: F401 — реекспортується для зворотної сумісності
+
 load_dotenv("token.env")
 
 SELECT_SITE, TYPING_KEYWORD, TYPING_COUNT, TYPING_YEAR, SELECT_FORMAT, SELECT_UK_MODE = range(6)
@@ -11,7 +13,6 @@ SELECT_SITE, TYPING_KEYWORD, TYPING_COUNT, TYPING_YEAR, SELECT_FORMAT, SELECT_UK
 scraping_status: dict = {}
 _status_lock = asyncio.Lock()
 
-MAX_PARALLEL_TASKS = 3          # максимум одночасних скрапінгів
 _bot_start_time = time.time()   # для health-check uptime
 
 # ── Timezone: зчитуємо з token.env, за замовчуванням Europe/Kyiv ──

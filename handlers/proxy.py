@@ -1,5 +1,4 @@
 import asyncio
-import importlib
 import logging
 import os
 import re
@@ -8,26 +7,24 @@ import tempfile
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 
-import proxy_settings
+import proxy.manager as proxy_manager
 from keyboards import get_proxy_kb, get_check_geo_kb
 
 logger = logging.getLogger(__name__)
 
 
 def _load_proxy_data() -> tuple[bool, dict]:
-    """Читає поточний стан проксі з proxy_settings.py."""
-    importlib.reload(proxy_settings)
-    use = getattr(proxy_settings, 'USE_PROXY', False)
-    proxies = getattr(proxy_settings, 'PROXIES', {})
+    """Читає поточний стан проксі з proxy_settings.json."""
+    data = proxy_manager.load()
+    proxies = data.get("proxies", {})
     if not isinstance(proxies, dict):
         proxies = {"France": [], "Finland": [], "General": []}
-    return use, proxies
+    return bool(data.get("use_proxy", False)), proxies
 
 
 def _save_proxy_data(use_proxy: bool, proxies: dict) -> None:
-    """Зберігає налаштування проксі назад у proxy_settings.py."""
-    with open("proxy_settings.py", "w", encoding="utf-8") as f:
-        f.write(f"USE_PROXY = {use_proxy}\nPROXIES = {proxies!r}\n")
+    """Зберігає налаштування проксі у proxy_settings.json."""
+    proxy_manager.save(use_proxy, proxies)
 
 
 def test_proxy(p: dict) -> bool:

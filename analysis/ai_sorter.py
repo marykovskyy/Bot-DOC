@@ -22,6 +22,13 @@ from openai import AsyncOpenAI
 logger = logging.getLogger(__name__)
 load_dotenv("token.env")
 
+
+def _diag_ai(client_id: str, msg: str) -> None:
+    """Пише в діагностичний лог doc_analyzer (спільний файл)."""
+    from analysis.doc_analyzer import _diag, _diag_ctx
+    _diag_ctx.client_id = client_id  # встановлюємо контекст для потоку
+    _diag(f"[AI] {msg}")
+
 # ─────────────────────────────────────────────
 #  КОНСТАНТИ
 # ─────────────────────────────────────────────
@@ -30,7 +37,9 @@ MAX_ZIP_SIZE_MB_TELEGRAM   = 50    # стандартний Telegram Bot API
 MAX_ZIP_UNCOMPRESSED_MB    = 5000  # до 5 ГБ розпакованих
 
 # Тимчасова папка для резервних ZIP (внутрішня, для /myresults)
-RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
+# __file__ тепер в analysis/ → шлях до results/ в кореневій папці проекту
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+RESULTS_DIR = os.path.join(_PROJECT_ROOT, "results")
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
 # ── Папка на робочому столі ──
@@ -246,33 +255,94 @@ def _get_progress_bar(done: int, total: int, length: int = 12) -> str:
 #  TEXTRACT
 # ─────────────────────────────────────────────
 
-async def _textract_analyze(image_bytes: bytes) -> dict:
-    """Викликає AWS Textract AnalyzeID.Повертає dict з полями: exp_date, doc_type, country, name"""
-    result = {"exp_date": None, "doc_type": None, "country": None, "name": None}
+async def _textract_analyze(image_bytes: bytes, client_id: str = "") -> dict:
+    """Викликає AWS Textract AnalyzeID.
+    Повертає dict з полями: exp_date, doc_type, country, name, _confidence, _error"""
+    result = {"exp_date": None, "doc_type": None, "country": None, "name": None,
+              "_confidence": 0.0, "_error": None}
 
     try:
         response = await asyncio.to_thread(
             textract_client.analyze_id,
             DocumentPages=[{'Bytes': image_bytes}]
         )
-        fields = response['IdentityDocuments'][0]['IdentityDocumentFields']
 
-        for field in fields:
-            ftype = field.get('Type', {}).get('Text', '')
-            val   = field.get('ValueDetection', {})
-            text  = val.get('NormalizedValue', {}).get('Value') or val.get('Text') or ""
+        # ── Діагностика: логуємо ВСІ поля від Textract ──
+        _diag_ai(client_id, "--- Textract AnalyzeID response ---")
+        for page_idx, id_doc in enumerate(response.get('IdentityDocuments', [])):
+            fields = id_doc.get('IdentityDocumentFields', [])
+            _diag_ai(client_id, f"  Page {page_idx}: {len(fields)} fields")
+            for field in fields:
+                ftype = field.get('Type', {}).get('Text', '')
+                ftype_conf = field.get('Type', {}).get('Confidence', 0.0)
+                val = field.get('ValueDetection', {})
+                raw_text = val.get('Text', '')
+                norm_val = val.get('NormalizedValue', {}).get('Value', '')
+                norm_type = val.get('NormalizedValue', {}).get('ValueType', '')
+                confidence = val.get('Confidence', 0.0)
 
-            if ftype in ('EXPIRATION_DATE', 'DOCUMENT_EXPIRATION_DATE'):
-                result["exp_date"] = str(text)
-            elif ftype == 'ID_TYPE':
-                result["doc_type"] = str(text)
-            elif ftype in ('STATE_NAME', 'COUNTRY'):
-                result["country"] = str(text)
-            elif ftype in ('LAST_NAME', 'FIRST_NAME') and text:
-                result["name"] = (result["name"] or "") + " " + text
+                # Логуємо кожне поле
+                norm_info = f" norm={norm_val}" if norm_val else ""
+                _diag_ai(client_id,
+                         f"    {ftype:30s} = {raw_text:30s}{norm_info:20s} "
+                         f"conf={confidence:5.1f}%  type_conf={ftype_conf:5.1f}%")
+
+        # ── Витягуємо потрібні поля ──
+        for id_doc in response.get('IdentityDocuments', []):
+            fields = id_doc.get('IdentityDocumentFields', [])
+
+            for field in fields:
+                ftype = field.get('Type', {}).get('Text', '')
+                val   = field.get('ValueDetection', {})
+                confidence = val.get('Confidence', 0.0)
+                # NormalizedValue — стандартизований формат від Textract (пріоритет)
+                text: str = val.get('NormalizedValue', {}).get('Value') or val.get('Text') or ""
+
+                if ftype in ('EXPIRATION_DATE', 'DOCUMENT_EXPIRATION_DATE'):
+                    # Беремо тільки якщо confidence > 50% (уникаємо сміття)
+                    if confidence > 50 and text.strip():
+                        # Якщо вже є дата — беремо ту що з вищим confidence
+                        if result["exp_date"] is None or confidence > result["_confidence"]:
+                            result["exp_date"] = text
+                            result["_confidence"] = confidence
+                elif ftype == 'ID_TYPE':
+                    result["doc_type"] = text
+                elif ftype == 'STATE_NAME' and text.strip():
+                    result["country"] = text
+                elif ftype == 'COUNTRY' and text.strip():
+                    # COUNTRY тільки якщо STATE_NAME ще не заповнено
+                    if not result["country"]:
+                        result["country"] = text
+                elif ftype == 'FIRST_NAME' and text.strip():
+                    result["name"] = text + " " + (result["name"] or "")
+                elif ftype == 'LAST_NAME' and text.strip():
+                    result["name"] = (result["name"] or "") + " " + text
+
+            # Якщо знайшли дату — не перевіряємо інші сторінки
+            if result["exp_date"]:
+                break
+
+        _diag_ai(client_id, f"  → exp_date={result['exp_date']}, "
+                 f"doc_type={result['doc_type']}, country={result['country']}, "
+                 f"conf={result['_confidence']:.1f}%")
 
     except Exception as e:
-        logger.debug("Textract error: %s", e)
+        err_name = type(e).__name__
+        if 'Throttling' in err_name or 'throttling' in str(e).lower():
+            logger.warning("Textract: throttling, потрібен retry")
+            result["_error"] = "throttling"
+            _diag_ai(client_id, f"  Textract THROTTLING")
+        elif 'InvalidParameter' in err_name or 'UnsupportedDocument' in err_name:
+            logger.warning("Textract: невалідний документ — %s", e)
+            result["_error"] = "invalid_param"
+            _diag_ai(client_id, f"  Textract INVALID: {e}")
+        else:
+            logger.warning("Textract error: %s", e)
+            result["_error"] = str(e)
+            _diag_ai(client_id, f"  Textract ERROR: {e}")
+
+    if result.get("name"):
+        result["name"] = result["name"].strip()
 
     return result
 
@@ -281,7 +351,7 @@ async def _textract_analyze(image_bytes: bytes) -> dict:
 #  OPENAI VISION (резерв)
 # ─────────────────────────────────────────────
 
-async def _openai_vision_analyze(image_bytes: bytes) -> dict:
+async def _openai_vision_analyze(image_bytes: bytes, client_id: str = "") -> dict:
     """GPT-4o Vision як резерв коли Textract не впорався.Повертає dict з exp_date та doc_type."""
     result = {"exp_date": None, "doc_type": None}
 
@@ -314,15 +384,20 @@ async def _openai_vision_analyze(image_bytes: bytes) -> dict:
             max_tokens=100,
             response_format={"type": "json_object"}
         )
+        raw_content = response.choices[0].message.content or "{}"
+        _diag_ai(client_id, f"--- OpenAI Vision response ---")
+        _diag_ai(client_id, f"  raw: {raw_content}")
         import json
-        data = json.loads(response.choices[0].message.content or "{}")
+        data = json.loads(raw_content)
         exp = data.get("exp_date") or ""
         if exp and exp.lower() not in ("null", "none", ""):
             result["exp_date"] = exp
         result["doc_type"] = data.get("doc_type")
+        _diag_ai(client_id, f"  → exp_date={result['exp_date']}, doc_type={result['doc_type']}")
 
     except Exception as e:
         logger.debug("OpenAI Vision error: %s", e)
+        _diag_ai(client_id, f"  OpenAI Vision ERROR: {e}")
 
     return result
 
@@ -331,10 +406,11 @@ async def _openai_vision_analyze(image_bytes: bytes) -> dict:
 #  ОСНОВНИЙ АНАЛІЗ ДОКУМЕНТА
 # ─────────────────────────────────────────────
 
-async def _analyze_single_image(image_bytes: bytes) -> dict:
+async def _analyze_single_image(image_bytes: bytes, client_id: str = "") -> dict:
     """Аналізує одне зображення:
-    1. Перевірка кешу (по MD5 хешу)
-    2. AWS Textract (основний)
+    0. Перевірка кешу (по MD5 хешу)
+    1. Локальний Tesseract OCR (~1-2 сек, безкоштовно)
+    2. AWS Textract (хмарний fallback)
     3. OpenAI Vision (запасний — тільки якщо Textract не знайшов дату)
     Semaphore на рівні клієнта в analyze_client_documents — тут не потрібен.
     Повертає: {exp_date, doc_type, source}"""
@@ -346,6 +422,8 @@ async def _analyze_single_image(image_bytes: bytes) -> dict:
     cached = await asyncio.to_thread(get_cache_entry, img_hash)
     if cached:
         logger.debug("Кеш-хіт для %s", img_hash[:8])
+        _diag_ai(client_id, f"CACHE HIT hash={img_hash[:8]} → exp={cached.get('exp_date')} "
+                 f"src={cached.get('source')}")
         return {
             "exp_date": cached.get("exp_date"),
             "doc_type": cached.get("doc_type"),
@@ -353,28 +431,94 @@ async def _analyze_single_image(image_bytes: bytes) -> dict:
             "source":   f"🗄 Кеш ({cached.get('source', '?')})",
         }
 
+    # ── Крок 1: Локальний Tesseract OCR (безкоштовний, ~1-2 сек) ──
+    try:
+        from analysis.doc_analyzer import local_analyze
+        # Timeout 30 сек — якщо preprocessing зависне, не блокуємо весь аналіз
+        local_result = await asyncio.wait_for(
+            asyncio.to_thread(local_analyze, image_bytes, client_id),
+            timeout=90.0
+        )
+        if local_result.get("exp_date"):
+            logger.info("Tesseract знайшов дату: %s (source: %s)", local_result["exp_date"], local_result.get("source"))
+            result = {
+                "exp_date": local_result["exp_date"],
+                "doc_type": local_result.get("doc_type"),
+                "country":  local_result.get("country"),
+                "source":   local_result.get("source", "Local OCR"),
+            }
+            await asyncio.to_thread(
+                save_cache_entry, img_hash,
+                result["exp_date"], result["doc_type"], result["country"], result["source"]
+            )
+            return result
+    except asyncio.TimeoutError:
+        logger.warning("Локальний OCR timeout (30с) — пропускаємо на Textract")
+        _diag_ai(client_id, "Local OCR TIMEOUT (30s) → Textract")
+    except Exception as e:
+        logger.warning("Локальний OCR помилка: %s", e)
+        _diag_ai(client_id, f"Local OCR ERROR: {e} → Textract")
+
     # Стискаємо в окремому потоці — Pillow CPU-bound, не блокує event loop
     compressed = await asyncio.to_thread(_compress_image, image_bytes)
 
-    # ── Крок 1: Textract ──
+    # ── Крок 2: Textract ──
     textract_result = {"exp_date": None, "doc_type": None}
     for attempt in range(API_RETRY_COUNT):
-        textract_result = await _textract_analyze(compressed)
+        textract_result = await _textract_analyze(compressed, client_id=client_id)
         if textract_result["exp_date"]:
             break
-        if attempt < API_RETRY_COUNT - 1:
+        # Retry тільки при throttling або помилці мережі, не при "дату не знайдено"
+        if textract_result.get("_error") == "throttling":
+            await asyncio.sleep(0.5 * (attempt + 1))   # зростаюча затримка
+        elif textract_result.get("_error"):
             await asyncio.sleep(0.2)
+        else:
+            break  # Textract нормально відпрацював, просто дати немає — retry марний
 
     exp_date_str = None
     if textract_result["exp_date"]:
+        raw = str(textract_result["exp_date"]).strip()
         try:
-            exp_date_str = dateparser.parse(
-                str(textract_result["exp_date"]).strip()
-            ).strftime("%Y-%m-%d")
+            # Textract NormalizedValue зазвичай у форматі YYYY-MM-DD або MM/DD/YYYY
+            # Спробувати спочатку ISO формат
+            from datetime import datetime as _dt
+            for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%m/%d/%Y", "%d/%m/%Y",
+                        "%Y-%m-%dT%H:%M:%S", "%d %b %Y", "%b %d, %Y"):
+                try:
+                    exp_date_str = _dt.strptime(raw, fmt).strftime("%Y-%m-%d")
+                    break
+                except ValueError:
+                    continue
+            # Fallback на dateparser якщо жоден формат не підійшов
+            if not exp_date_str:
+                exp_date_str = dateparser.parse(raw).strftime("%Y-%m-%d")
         except Exception:
-            pass
+            logger.warning("Не вдалось розпарсити Textract дату: %r", raw)
 
     if exp_date_str:
+        doc_type_raw = (textract_result.get("doc_type") or "").upper()
+        is_back_side = "BACK" in doc_type_raw
+
+        # ── Перевірка BACK сторони: Textract часто плутає ISS/RE-ISS з EXP ──
+        # Якщо Textract каже що це BACK і дата прострочена — не довіряти
+        if is_back_side:
+            from datetime import datetime as _dt_check
+            try:
+                parsed_exp = _dt_check.strptime(exp_date_str, "%Y-%m-%d")
+                if parsed_exp < _dt_check.now():
+                    _diag_ai(client_id,
+                             f"Textract BACK side → {exp_date_str} PAST date, "
+                             f"likely ISS/RE-ISS → SKIP, try OpenAI Vision")
+                    exp_date_str = None  # скидаємо — не довіряємо
+                else:
+                    _diag_ai(client_id,
+                             f"Textract BACK side → {exp_date_str} future date → OK")
+            except ValueError:
+                pass
+
+    if exp_date_str:
+        _diag_ai(client_id, f"Textract → {exp_date_str} (doc_type={textract_result.get('doc_type')}, country={textract_result.get('country')})")
         result = {
             "exp_date": exp_date_str,
             "doc_type": textract_result.get("doc_type"),
@@ -387,9 +531,10 @@ async def _analyze_single_image(image_bytes: bytes) -> dict:
         )
         return result
 
-    # ── Крок 2: OpenAI Vision (запасний — тільки якщо Textract не дав дату) ──
+    # ── Крок 3: OpenAI Vision (запасний — тільки якщо Textract не дав дату) ──
+    _diag_ai(client_id, "Textract → no date, trying OpenAI Vision")
     logger.debug("Textract не знайшов дату — пробуємо OpenAI Vision")
-    vision_result = await _openai_vision_analyze(compressed)
+    vision_result = await _openai_vision_analyze(compressed, client_id=client_id)
 
     if vision_result["exp_date"]:
         try:
@@ -442,7 +587,7 @@ async def analyze_client_documents(client_name: str, client_path: str) -> dict:
         for img_path in images:
             try:
                 img_bytes = await asyncio.to_thread(_read_image, img_path)
-                result = await _analyze_single_image(img_bytes)
+                result = await _analyze_single_image(img_bytes, client_id=client_name)
                 last_result = result
                 if result["exp_date"]:
                     break  # знайшли дату — достатньо
@@ -838,15 +983,14 @@ async def handle_delivery_callback(update: Update, context: ContextTypes.DEFAULT
         await query.edit_message_text("📢 Надсилаю результати в канал/групу...")
 
         msg_ch  = query.message
-        chat_id_ch = msg_ch.chat_id if msg_ch else None
+        chat_id_ch: int = msg_ch.chat_id if msg_ch else 0
         if not chat_id_ch:
             return
 
         try:
-            channel_id = int(_TG_RESULTS_CHANNEL)
+            channel_id: int | str = int(_TG_RESULTS_CHANNEL)
         except ValueError:
-            channel_id_str = _TG_RESULTS_CHANNEL
-            channel_id = channel_id_str  # type: ignore[assignment]
+            channel_id = _TG_RESULTS_CHANNEL
 
         label_suffix = code
         ch_parts = 0
@@ -931,7 +1075,10 @@ async def cancel_analysis_callback(update: Update, context: ContextTypes.DEFAULT
     query = update.callback_query
     if not query:
         return
-    await query.answer("⛔ Скасування...")
+    try:
+        await query.answer("⛔ Скасування...")
+    except Exception:
+        pass  # query expired — не критично
 
     raw_data: str = query.data or ""
     m = re.match(r"cancel_analysis_(\d+)", raw_data)
@@ -1113,6 +1260,7 @@ async def download_from_gdrive(gdrive_url: str, dest_path: str,
 
     def _download():
         import requests
+        import time
 
         session = requests.Session()
         headers = {
@@ -1128,35 +1276,98 @@ async def download_from_gdrive(gdrive_url: str, dest_path: str,
             f"https://drive.usercontent.google.com/download"
             f"?id={file_id}&export=download&confirm=t"
         )
-        resp = session.get(url, headers=headers, stream=True, timeout=300)
-        resp.raise_for_status()
-
-        # Якщо Google повернув HTML (файл закритий або потрібен confirm-token)
-        content_type = resp.headers.get('Content-Type', '')
-        if 'text/html' in content_type:
-            # Спробуємо старий endpoint з cookie-токеном підтвердження
-            token = next(
-                (v for k, v in resp.cookies.items() if k.startswith('download_warning')),
-                None
-            )
-            if token:
-                resp = session.get(
-                    f"https://drive.google.com/uc?export=download&id={file_id}&confirm={token}",
-                    headers=headers, stream=True, timeout=300
-                )
-                resp.raise_for_status()
-            else:
-                raise ValueError(
-                    "Google Drive повернув сторінку підтвердження замість файлу.\n"
-                    "Переконайтесь що доступ до файлу встановлено: "
-                    "'Усі хто має посилання → Переглядач'."
-                )
 
         chunk_size = 1024 * 1024  # 1 MB
-        with open(dest_path, 'wb') as f:
-            for chunk in resp.iter_content(chunk_size=chunk_size):
-                if chunk:
-                    f.write(chunk)
+        max_retries = 5
+        downloaded = 0
+
+        for attempt in range(max_retries):
+            try:
+                req_headers = dict(headers)
+                # Resume: якщо вже щось завантажили — продовжуємо з того місця
+                if downloaded > 0:
+                    req_headers['Range'] = f'bytes={downloaded}-'
+                    logger.info("Google Drive: resume з %d МБ (спроба %d/%d)",
+                                downloaded // (1024 * 1024), attempt + 1, max_retries)
+
+                resp = session.get(url, headers=req_headers, stream=True, timeout=600)
+
+                # 416 = Range Not Satisfiable — файл вже повністю завантажений
+                if resp.status_code == 416:
+                    return dest_path
+
+                resp.raise_for_status()
+
+                # Якщо Google повернув HTML (файл закритий або потрібен confirm-token)
+                content_type = resp.headers.get('Content-Type', '')
+                if 'text/html' in content_type and attempt == 0:
+                    token = next(
+                        (v for k, v in resp.cookies.items()
+                         if k.startswith('download_warning')),
+                        None
+                    )
+                    if token:
+                        url = (f"https://drive.google.com/uc?"
+                               f"export=download&id={file_id}&confirm={token}")
+                        resp = session.get(url, headers=headers, stream=True, timeout=600)
+                        resp.raise_for_status()
+                    else:
+                        raise ValueError(
+                            "Google Drive повернув сторінку підтвердження замість файлу.\n"
+                            "Переконайтесь що доступ до файлу встановлено: "
+                            "'Усі хто має посилання → Переглядач'."
+                        )
+
+                # Загальний розмір (Content-Length або Content-Range)
+                total_size = None
+                cr = resp.headers.get('Content-Range', '')
+                if cr and '/' in cr:
+                    try:
+                        total_size = int(cr.split('/')[-1])
+                    except ValueError:
+                        pass
+                if total_size is None:
+                    cl = resp.headers.get('Content-Length')
+                    if cl:
+                        try:
+                            total_size = downloaded + int(cl)
+                        except ValueError:
+                            pass
+
+                # Пишемо: append якщо resume, інакше overwrite
+                mode = 'ab' if downloaded > 0 else 'wb'
+                last_report = 0  # останній звіт (в МБ)
+                with open(dest_path, mode) as f:
+                    for chunk in resp.iter_content(chunk_size=chunk_size):
+                        if chunk:
+                            f.write(chunk)
+                            downloaded += len(chunk)
+                            # Звітуємо кожні 50 МБ
+                            cur_mb = downloaded // (1024 * 1024)
+                            if cur_mb - last_report >= 50:
+                                last_report = cur_mb
+                                if progress_cb and total_size:
+                                    pct = downloaded * 100 // total_size
+                                    progress_cb(downloaded, total_size, pct)
+                                elif progress_cb:
+                                    progress_cb(downloaded, 0, 0)
+
+                # Фінальний звіт
+                if progress_cb:
+                    progress_cb(downloaded, downloaded, 100)
+
+                # Успішно завантажили весь файл
+                return dest_path
+
+            except (requests.exceptions.ConnectionError,
+                    requests.exceptions.ChunkedEncodingError,
+                    requests.exceptions.Timeout) as e:
+                logger.warning("Google Drive: обрив на %d МБ: %s",
+                               downloaded // (1024 * 1024), e)
+                if attempt < max_retries - 1:
+                    time.sleep(3 * (attempt + 1))  # 3, 6, 9, 12 сек
+                else:
+                    raise
 
         return dest_path
 
@@ -1181,7 +1392,49 @@ async def handle_gdrive_link(update: Update, context: ContextTypes.DEFAULT_TYPE)
     zip_path = os.path.join(work_dir, "gdrive.zip")
 
     try:
-        await download_from_gdrive(url, zip_path)
+        # Прогрес завантаження — оновлюємо повідомлення в Telegram
+        import threading
+        _progress_state = {"text": "", "lock": threading.Lock()}
+
+        def _on_progress(downloaded: int, total: int, pct: int):
+            dl_mb = downloaded / (1024 * 1024)
+            if total > 0:
+                total_mb = total / (1024 * 1024)
+                bar_len = 20
+                filled = int(bar_len * pct / 100)
+                bar = "▓" * filled + "░" * (bar_len - filled)
+                txt = (
+                    f"⏳ Завантаження з Google Drive...\n\n"
+                    f"`[{bar}]` {pct}%\n"
+                    f"📥 {dl_mb:.0f} / {total_mb:.0f} МБ"
+                )
+            else:
+                txt = f"⏳ Завантаження з Google Drive...\n📥 {dl_mb:.0f} МБ завантажено"
+            with _progress_state["lock"]:
+                _progress_state["text"] = txt
+
+        # Фонова задача оновлення повідомлення (щоб не блокувати потік)
+        _progress_stop = asyncio.Event()
+
+        async def _update_tg_progress():
+            last_text = ""
+            while not _progress_stop.is_set():
+                await asyncio.sleep(3)
+                with _progress_state["lock"]:
+                    txt = _progress_state["text"]
+                if txt and txt != last_text:
+                    try:
+                        await status_msg.edit_text(txt, parse_mode="Markdown")
+                        last_text = txt
+                    except Exception:
+                        pass
+
+        progress_task = asyncio.create_task(_update_tg_progress())
+
+        await download_from_gdrive(url, zip_path, progress_cb=_on_progress)
+
+        _progress_stop.set()
+        await progress_task
 
         file_size_mb = os.path.getsize(zip_path) / 1024 / 1024
         await status_msg.edit_text(
@@ -1242,6 +1495,13 @@ async def _process_zip_file(update: Update, context: ContextTypes.DEFAULT_TYPE,
         ]
         total = len(client_folders)
 
+        # ── Діагностика: початок сесії ──
+        from analysis.doc_analyzer import _diag, _diag_ctx
+        _diag_ctx.client_id = ""
+        _diag(f"{'#' * 80}")
+        _diag(f"SESSION START: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | {total} clients")
+        _diag(f"{'#' * 80}")
+
         if total == 0:
             await status_msg.edit_text("⚠️ В архіві не знайдено папок клієнтів.")
             return
@@ -1272,6 +1532,7 @@ async def _process_zip_file(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
         completed_count = 0
         results_map: dict[int, dict] = {}
+        source_counts: dict[str, int] = {}  # лічильник джерел: "Local OCR" → N, "AWS Textract" → N
 
         async def _process_one(idx: int, name: str, path: str) -> None:
             nonlocal completed_count
@@ -1296,6 +1557,20 @@ async def _process_zip_file(update: Update, context: ContextTypes.DEFAULT_TYPE,
                         "is_valid": False, "error": "exception"
                     }
                 results_map[idx] = result
+                # Рахуємо джерело розпізнавання
+                src = result.get("source", "?")
+                # Спрощуємо назву для лічильника
+                if "Кеш" in src:
+                    src_key = "🗄 Кеш"
+                elif "Local" in src:
+                    src_key = "🖥 Локальний"
+                elif "Textract" in src:
+                    src_key = "☁️ Textract"
+                elif "Vision" in src or "OpenAI" in src:
+                    src_key = "🤖 OpenAI"
+                else:
+                    src_key = "❓ Інше"
+                source_counts[src_key] = source_counts.get(src_key, 0) + 1
                 completed_count += 1  # завжди рахуємо, навіть при помилці
 
         # Фоновий таск — оновлює прогрес кожні PROGRESS_UPDATE_SEC секунд
@@ -1318,12 +1593,15 @@ async def _process_zip_file(update: Update, context: ContextTypes.DEFAULT_TYPE,
                     )
                 ]])
                 try:
+                    # Статистика джерел
+                    src_text = " | ".join(f"{k}: {v}" for k, v in sorted(source_counts.items()))
                     await status_msg.edit_text(
                         f"⚙️ Аналіз документів...\n"
                         f"{bar}\n"
                         f"✅ Оброблено: {done}/{total}\n"
                         f"⚡ Швидкість: {speed:.1f} кл/с\n"
-                        f"⏳ Залишилось: ~{eta // 60}хв {eta % 60}с",
+                        f"⏳ Залишилось: ~{eta // 60}хв {eta % 60}с\n"
+                        f"📊 {src_text}" if src_text else "",
                         reply_markup=cancel_kb,
                     )
                 except Exception:
@@ -1333,33 +1611,90 @@ async def _process_zip_file(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
         # Запускаємо всі задачі
         all_tasks = [
-            _process_one(i, name, path)
+            asyncio.create_task(_process_one(i, name, path))
             for i, (name, path) in enumerate(client_folders)
         ]
-        await asyncio.gather(*all_tasks, return_exceptions=True)
+
+        # Чекаємо завершення АБО скасування
+        cancel_event = _cancel_events.get(chat_id) if chat_id else None
+        done_normally = True
+
+        if cancel_event:
+            # Перевіряємо кожну секунду чи не натиснули "Скасувати"
+            while not all(t.done() for t in all_tasks):
+                if cancel_event.is_set():
+                    # Скасовуємо всі незавершені задачі
+                    for t in all_tasks:
+                        if not t.done():
+                            t.cancel()
+                    # Чекаємо завершення вже запущених (max 5 сек)
+                    await asyncio.wait(all_tasks, timeout=5.0)
+                    done_normally = False
+                    break
+                await asyncio.sleep(1.0)
+        else:
+            await asyncio.gather(*all_tasks, return_exceptions=True)
+
+        # Якщо все завершилось нормально, збираємо винятки
+        if done_normally:
+            for t in all_tasks:
+                if t.done() and not t.cancelled():
+                    try:
+                        exc = t.exception()
+                        if exc:
+                            logger.error("Task exception: %s", exc)
+                    except Exception:
+                        pass
 
         _progress_stop.set()
         progress_task.cancel()
+        try:
+            await progress_task
+        except asyncio.CancelledError:
+            pass
 
         # Відновлюємо порядок результатів (fallback якщо якийсь індекс відсутній)
+        cancelled_label = "⛔ Скасовано" if not done_normally else "❌ Не оброблено"
         results = [
             results_map.get(i, {
-                "name": client_folders[i][0], "status": "❌ Не оброблено",
+                "name": client_folders[i][0], "status": cancelled_label,
                 "exp_date": None, "doc_type": None,
-                "is_valid": False, "error": "missing"
+                "is_valid": False, "error": "cancelled" if not done_normally else "missing"
             })
             for i in range(total)
         ]
 
         elapsed_total = (datetime.now() - start_time).seconds
 
+        # ── Діагностика: підсумок сесії ──
+        from analysis.doc_analyzer import _diag, _diag_ctx
+        _diag_ctx.client_id = ""
+        _diag(f"{'#' * 80}")
+        _diag(f"SESSION END: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | "
+              f"{elapsed_total}s | {completed_count}/{total}")
+        _diag(f"Sources: {source_counts}")
+        for i in range(total):
+            r = results_map.get(i)
+            if r:
+                name = r.get("name", client_folders[i][0])
+                exp = r.get("exp_date", "—")
+                src = r.get("source", "?")
+                status = r.get("status", "?")
+                _diag(f"  {name:30s} exp={str(exp or '—'):12s} src={str(src or '?'):25s} {status}")
+        _diag(f"{'#' * 80}")
+
         # Розкладаємо по папках
-        valid_count = invalid_count = unknown_count = 0
+        valid_count = invalid_count = unknown_count = cancelled_count = 0
         for (client_name, client_path), r in zip(client_folders, results):
-            if r.get("error") == "no_image" or r.get("error") == "date_not_found":
+            err = r.get("error", "")
+            if err in ("cancelled", "missing"):
+                # Скасовані/необроблені — в невизначені
+                dest = os.path.join(unknown_dir, client_name)
+                cancelled_count += 1
+            elif err in ("no_image", "date_not_found"):
                 dest = os.path.join(unknown_dir, client_name)
                 unknown_count += 1
-            elif r["is_valid"]:
+            elif r.get("is_valid", False):
                 dest = os.path.join(valid_dir, client_name)
                 valid_count += 1
             else:
@@ -1372,14 +1707,27 @@ async def _process_zip_file(update: Update, context: ContextTypes.DEFAULT_TYPE,
         # Підсумок
         elapsed_min = elapsed_total // 60
         elapsed_sec = elapsed_total % 60
-        summary = (
-            f"✅ AI Аналіз завершено!\n\n"
-            f"✅ Дійсних: {valid_count}\n"
-            f"❌ Прострочених: {invalid_count}\n"
-            f"❓ Невизначених: {unknown_count}\n"
-            f"📊 Всього: {total}\n\n"
-            f"⏱ Час: {elapsed_min}хв {elapsed_sec}с"
-        )
+        processed = valid_count + invalid_count + unknown_count
+        if not done_normally:
+            summary = (
+                f"⛔ Аналіз скасовано!\n\n"
+                f"✅ Дійсних: {valid_count}\n"
+                f"❌ Прострочених: {invalid_count}\n"
+                f"❓ Невизначених: {unknown_count}\n"
+                f"⛔ Не оброблено: {cancelled_count}\n"
+                f"📊 Оброблено: {processed}/{total}\n\n"
+                f"⏱ Час: {elapsed_min}хв {elapsed_sec}с\n\n"
+                f"💾 Результати оброблених документів збережено."
+            )
+        else:
+            summary = (
+                f"✅ AI Аналіз завершено!\n\n"
+                f"✅ Дійсних: {valid_count}\n"
+                f"❌ Прострочених: {invalid_count}\n"
+                f"❓ Невизначених: {unknown_count}\n"
+                f"📊 Всього: {total}\n\n"
+                f"⏱ Час: {elapsed_min}хв {elapsed_sec}с"
+            )
         await status_msg.edit_text(summary)
 
         # ── Excel звіт ──

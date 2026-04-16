@@ -13,7 +13,7 @@ from telegram.ext import ContextTypes
 
 from config import ADMIN_ID
 from state import scraping_status, _status_lock, MAX_PARALLEL_TASKS, _bot_start_time
-from handlers_admin import is_admin
+from handlers.admin import is_admin
 
 logger = logging.getLogger(__name__)
 

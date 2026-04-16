@@ -54,25 +54,20 @@ def with_retry(
     return decorator
 
 
-def retry_request(func, *args, max_retries: int = 3, delay: float = 1.5, **kwargs):
+def retry_request(func, *args,
+                  max_retries: int = 3,
+                  delay: float = 1.5,
+                  backoff: float = 2.0,
+                  **kwargs):
     """
     Виклик функції з retry без декоратора (для вбудованих викликів).
+    Використовує ту саму логіку що й with_retry — без дублювання.
 
     Приклад:
         data = retry_request(requests.get, url, timeout=30, max_retries=3)
     """
-    last_exc: BaseException | None = None
-    wait = delay
-    for attempt in range(1, max_retries + 1):
-        try:
-            return func(*args, **kwargs)
-        except Exception as exc:
-            last_exc = exc
-            if attempt < max_retries:
-                logger.warning(
-                    "[retry %d/%d] → %s. Очікуємо %.1f сек...",
-                    attempt, max_retries, exc, wait
-                )
-                time.sleep(wait)
-                wait *= 2.0
-    raise last_exc  # type: ignore[misc]
+    @with_retry(max_retries=max_retries, delay=delay, backoff=backoff)
+    def _inner():
+        return func(*args, **kwargs)
+
+    return _inner()

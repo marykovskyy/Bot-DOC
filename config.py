@@ -1,11 +1,11 @@
 import os
 from dotenv import load_dotenv
 
-load_dotenv(".env.example")
+load_dotenv("token.env")
 
 # --- СЕКРЕТИ (з .env, не з коду!) ---
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-ADMIN_ID = int(os.getenv("TELEGRAM_ADMIN_ID", "790612931"))
+ADMIN_ID = int(os.getenv("TELEGRAM_ADMIN_ID", "0"))
 
 if not TOKEN:
     raise RuntimeError("❌ TELEGRAM_BOT_TOKEN не знайдено в .env файлі!")

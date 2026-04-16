@@ -1,8 +1,6 @@
-import importlib
-
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 
-import proxy_settings
+import proxy.manager as proxy_manager
 from config import SCRAPER_CONFIG
 
 
@@ -58,8 +56,7 @@ def get_stop_kb() -> InlineKeyboardMarkup:
 
 
 def get_proxy_kb() -> InlineKeyboardMarkup:
-    importlib.reload(proxy_settings)
-    is_used = getattr(proxy_settings, 'USE_PROXY', False)
+    is_used = proxy_manager.get_use_proxy()
     status_emoji = "✅ Увімкнено" if is_used else "❌ Вимкнено"
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📂 Завантажити з файлу (.txt)", callback_data="proxy_upload_info")],
@@ -80,7 +77,7 @@ def get_check_geo_kb() -> InlineKeyboardMarkup:
 
 
 def get_schedule_kb() -> InlineKeyboardMarkup:
-    from handlers_schedule import CRON_OPTIONS
+    from handlers.schedule import CRON_OPTIONS
     buttons = [[InlineKeyboardButton(label, callback_data=f"sched_{cron}")]
                for label, cron in CRON_OPTIONS.items()]
     buttons.append([InlineKeyboardButton("❌ Скасувати", callback_data="cancel_search")])

@@ -6,6 +6,7 @@ from telegram.ext import ContextTypes
 
 import database
 from config import ADMIN_ID
+from constants import COUNTRY_FLAGS
 from state import scraping_status
 
 logger = logging.getLogger(__name__)
@@ -58,9 +59,6 @@ async def show_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     )
 
     if db_stats:
-        flags = {"France": "🇫🇷", "Finland": "🇫🇮", "Denmark": "🇩🇰",
-                 "California": "🇺🇸", "UnitedKingdom": "🇬🇧", "Latvia": "🇱🇻",
-                 "NewZealand": "🇳🇿", "Thailand": "🇹🇭", "CzechRepublic": "🇨🇿"}
         text += "🌍 **ГЛОБАЛЬНА СТАТИСТИКА:**\n"
         text += f"🏢 Всього зібрано: **{db_stats['total']}** компаній\n"
         text += f"📅 Додано сьогодні: **{db_stats['today']}**\n\n"
@@ -330,7 +328,7 @@ async def help_section_callback(update: Update, context: ContextTypes.DEFAULT_TY
     query = update.callback_query
     if not query or not query.data or not update.effective_user:
         return
-    from handlers_scraping import safe_answer
+    from handlers.scraping import safe_answer
     await safe_answer(query)
     if query.data == "noop":
         return
@@ -454,15 +452,15 @@ async def repeat_from_history(update: Update, context: ContextTypes.DEFAULT_TYPE
     """Callback: повторити пошук з історії."""
     import asyncio
     import threading
-    from scraper import run_scraping
+    from scrapers.main import run_scraping
     from state import scraping_status, _status_lock, MAX_PARALLEL_TASKS
     from keyboards import get_stop_kb
-    from handlers_scraping import status_updater
+    from handlers.scraping import status_updater
 
     query = update.callback_query
     if not query or not query.data or not update.effective_user:
         return
-    from handlers_scraping import safe_answer
+    from handlers.scraping import safe_answer
     await safe_answer(query)
 
     history_id = int(query.data.replace("repeat_", ""))

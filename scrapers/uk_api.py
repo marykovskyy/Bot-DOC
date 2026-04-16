@@ -127,11 +127,17 @@ def scrape_uk_api(keyword: str, max_count: int, status_dict: dict) -> list[dict]
                 logger.info("Відбраковано (DS01): %s", name)
                 continue
 
-            # Посилання NEWINC для таблиці (view, не download)
-            main_link = next(
+            # Посилання NEWINC — ОБОВ'ЯЗКОВО, без нього компанія не потрапляє в результат
+            newinc_link = next(
                 (lnk.replace("download=1", "download=0") for fname, lnk in docs.items() if "NEWINC" in fname),
-                list(docs.values())[0].replace("download=1", "download=0")
+                None
             )
+            if not newinc_link:
+                logger.info("Пропущено (немає NEWINC): %s", name)
+                status_dict.setdefault('filtered_no_newinc', 0)
+                status_dict['filtered_no_newinc'] += 1
+                continue
+            main_link = newinc_link
 
             # ── РЕЖИМ 1: тільки посилання ──────────────────────────────────
             if not do_download:

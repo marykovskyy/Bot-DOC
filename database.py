@@ -52,8 +52,49 @@ def get_connection():
         conn.close()
 
 
+# ── Версія схеми БД ──────────────────────────────────────────────────────────
+# Збільшуйте цей лічильник кожен раз коли додаєте нову міграцію в _run_migrations().
+# SQLite зберігає поточну версію в PRAGMA user_version.
+_SCHEMA_VERSION = 1
+
+
+def _run_migrations(conn: sqlite3.Connection) -> None:
+    """
+    Система версійних міграцій.
+
+    Як додати нову міграцію:
+      1. Збільшити _SCHEMA_VERSION на 1
+      2. Додати блок:
+           if current_version < N:
+               conn.execute("ALTER TABLE ...")
+               conn.execute("PRAGMA user_version = N")
+               logger.info("Міграція до версії N виконана.")
+
+    Блоки виконуються послідовно — можна мігрувати через кілька версій одразу.
+    """
+    current_version: int = conn.execute("PRAGMA user_version").fetchone()[0]
+
+    if current_version >= _SCHEMA_VERSION:
+        return  # БД вже актуальна
+
+    logger.info("Поточна версія БД: %d → мігруємо до: %d", current_version, _SCHEMA_VERSION)
+
+    # ── Версія 0 → 1: базова схема (таблиці вже створені через CREATE IF NOT EXISTS) ──
+    if current_version < 1:
+        # Тут можна додати ALTER TABLE для існуючих таблиць якщо потрібно.
+        # Наприклад: conn.execute("ALTER TABLE companies ADD COLUMN category TEXT DEFAULT ''")
+        conn.execute(f"PRAGMA user_version = 1")
+        logger.info("Міграція до версії 1 виконана.")
+
+    # ── Версія 1 → 2: приклад майбутньої міграції ──
+    # if current_version < 2:
+    #     conn.execute("ALTER TABLE users ADD COLUMN last_active TIMESTAMP")
+    #     conn.execute("PRAGMA user_version = 2")
+    #     logger.info("Міграція до версії 2 виконана.")
+
+
 def init_db() -> None:
-    """Створює всі таблиці та індекси при першому запуску.
+    """Створює всі таблиці, індекси та виконує міграції при запуску.
     WAL-режим вмикається тут один раз — зберігається в файлі БД.
     """
     with get_connection() as conn:
@@ -152,6 +193,9 @@ def init_db() -> None:
                 cached_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
+
+        # ── Міграції: виконуються після CREATE IF NOT EXISTS ──
+        _run_migrations(conn)
 
 
 # ─────────────────────────────────────────────

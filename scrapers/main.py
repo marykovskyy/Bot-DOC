@@ -6,23 +6,27 @@ import tempfile
 import random
 import logging
 import pandas as pd
-import importlib
 import threading
 from typing import Optional, List, Set, Dict, Any
 
 from config import SCRAPER_CONFIG
+from constants import (
+    CAPTCHA_MAX_WAIT_SEC, CAPTCHA_POLL_INTERVAL_SEC,
+    ELEMENT_WAIT_RETRIES, BROWSER_LAUNCH_TIMEOUT_SEC,
+    SHEETS_WRITE_DELAY,
+)
 from DrissionPage import ChromiumPage, ChromiumOptions  # type: ignore[import]
-import proxy_settings
-from california_scraper import scrape_california
-from denmark_scraper import scrape_denmark
-from czech_scraper import scrape_czech
-from uk_api_scraper import scrape_uk_api
-from latvia_scraper import scrape_latvia
-from new_zealand_scraper import scrape_new_zealand
-from thailand_scraper import scrape_thailand
-from france_scraper import scrape_france_api   # ← API-скрапер (pappers.ai JSON)
-from finland_scraper import scrape_finland_api  # ← API-скрапер (PRH open data)
-import turkey_scraper
+import proxy.manager as proxy_manager
+from scrapers.california import scrape_california
+from scrapers.denmark import scrape_denmark
+from scrapers.czech import scrape_czech
+from scrapers.uk_api import scrape_uk_api
+from scrapers.latvia import scrape_latvia
+from scrapers.new_zealand import scrape_new_zealand
+from scrapers.thailand import scrape_thailand
+from scrapers.france import scrape_france_api   # ← API-скрапер (pappers.ai JSON)
+from scrapers.finland import scrape_finland_api  # ← API-скрапер (PRH open data)
+from scrapers import turkey as turkey_scraper
 import database
 import gsheets
 
@@ -36,7 +40,7 @@ logger = logging.getLogger(__name__)
 import queue
 
 _sheets_queue: queue.Queue = queue.Queue()
-_SHEETS_WRITE_DELAY = 1.2  # секунд між записами (ліміт Sheets ~60 req/min)
+_SHEETS_WRITE_DELAY = SHEETS_WRITE_DELAY  # секунд між записами (ліміт Sheets ~60 req/min)
 
 
 def _sheets_worker() -> None:
@@ -56,8 +60,8 @@ def _sheets_worker() -> None:
             time.sleep(_SHEETS_WRITE_DELAY)
 
 
-# Запускаємо один постійний потік-воркер (не daemon — дочекається завершення)
-_sheets_thread = threading.Thread(target=_sheets_worker, daemon=False)
+# Запускаємо один постійний потік-воркер (daemon — не блокує завершення процесу)
+_sheets_thread = threading.Thread(target=_sheets_worker, daemon=True)
 _sheets_thread.start()
 
 
@@ -72,10 +76,8 @@ def flush_sheets_queue() -> None:
 
 
 # --- Таймаути (константи замість магічних чисел) ---
-CAPTCHA_MAX_WAIT_SEC = 90
-CAPTCHA_POLL_INTERVAL_SEC = 5
-ELEMENT_WAIT_RETRIES = 15
-BROWSER_LAUNCH_TIMEOUT_SEC = 30
+# Таймаути — визначені в constants.py, тут лише підтвердження що імпортовані
+# CAPTCHA_MAX_WAIT_SEC, CAPTCHA_POLL_INTERVAL_SEC, ELEMENT_WAIT_RETRIES, BROWSER_LAUNCH_TIMEOUT_SEC
 
 
 
@@ -304,9 +306,9 @@ def get_page(chat_id: int, status_dict: dict, site_key: str = "General") -> tupl
     options.set_pref("webrtc.multiple_routes_enabled", False)
     options.set_pref("webrtc.nonproxied_udp_enabled", False)
 
-    importlib.reload(proxy_settings)
-    use_proxy = getattr(proxy_settings, "USE_PROXY", False)
-    proxies_dict = getattr(proxy_settings, "PROXIES", {})
+    _proxy_data = proxy_manager.load()
+    use_proxy   = _proxy_data.get("use_proxy", False)
+    proxies_dict = _proxy_data.get("proxies", {})
 
     available_proxies: List[dict] = []
     if use_proxy:
