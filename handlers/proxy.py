@@ -347,6 +347,13 @@ async def proxy_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
 
 @require_auth
 async def prompt_for_zip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # Активуємо «режим очікування документів» на 30 хв.
+    # handle_gdrive_link перевіряє цей прапорець перед запуском аналізу,
+    # щоб випадково скопійоване drive-посилання не тригерило аналіз.
+    import time as _time
+    if context.user_data is not None:
+        context.user_data["awaiting_docs_until"] = _time.time() + 1800
+
     text = (
         "📁 **Перевірка фізичних документів (ШІ)**\n\n"
         "Цей модуль перевірить термін дії документів і розсортує їх.\n\n"
@@ -360,7 +367,7 @@ async def prompt_for_zip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         "1. Завантаж ZIP на **Google Drive**\n"
         "2. ПКМ → _Поділитись_ → _Усі хто має посилання_\n"
         "3. Скопіюй посилання і надішли сюди\n\n"
-        "👉 _Чекаю на ZIP-архів або Google Drive посилання..._"
+        "👉 _Чекаю на ZIP-архів або Google Drive посилання_ (30 хв)"
     )
     if update.message:
         await update.message.reply_text(text, parse_mode="Markdown")

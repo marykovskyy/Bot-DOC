@@ -1401,13 +1401,37 @@ async def download_from_gdrive(gdrive_url: str, dest_path: str,
 
 @require_auth
 async def handle_gdrive_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обробляє Google Drive посилання надіслане в чат.Завантажує ZIP і передає в handle_zip_documents_from_path."""
+    """Обробляє Google Drive посилання надіслане в чат.Завантажує ZIP і передає в handle_zip_documents_from_path.
+
+    ВАЖЛИВО: Аналіз запускається ТІЛЬКИ якщо юзер спочатку натиснув
+    «📁 Перевірка фіз. доків» (prompt_for_zip виставляє awaiting_docs_until
+    у context.user_data на 30 хв). Інакше випадково скинуте drive-посилання
+    не тригерить аналіз.
+    """
     if not update.message or not update.message.text:
         return
 
     url = update.message.text.strip()
     if 'drive.google.com' not in url:
         return
+
+    # ── Gate: перевіряємо чи юзер у режимі очікування документів ──
+    import time as _time
+    awaiting_until = 0.0
+    if context.user_data is not None:
+        awaiting_until = float(context.user_data.get("awaiting_docs_until", 0) or 0)
+
+    if awaiting_until < _time.time():
+        await update.message.reply_text(
+            "ℹ️ Щоб запустити аналіз документів — спочатку натисни кнопку "
+            "«📁 Перевірка фіз. доків» у меню, а потім надішли посилання."
+        )
+        return
+
+    # Споживаємо токен — один натиск кнопки = одна сесія. Якщо треба ще раз,
+    # користувач повторно натисне кнопку.
+    if context.user_data is not None:
+        context.user_data.pop("awaiting_docs_until", None)
 
     status_msg = await update.message.reply_text(
         "🔗 Виявлено посилання Google Drive.\n"
