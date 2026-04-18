@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install light deps (без тяжких ML-пакетів)
+        # Для CI встановлюємо тільки пакети потрібні тестам. paddleocr/boto3/
+        # DrissionPage не тестуються — імпорти мокуються в тестах.
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest pytest-cov ruff pip-audit
+          # Мінімум для test_bot.py (database, proxy/manager, utils, constants)
+          pip install python-telegram-bot==20.7 python-dotenv aiohttp
+
+      - name: Ruff lint
+        run: ruff check . --output-format=github
+        continue-on-error: true  # не блокуємо merge — поки baseline не зафіксовано
+
+      - name: Run pytest
+        run: pytest test_bot.py -v --tb=short
+
+      - name: pip-audit (уразливості залежностей)
+        run: pip-audit -r requirements.txt --ignore-vuln GHSA-dummy || true
+        # Не блокуємо PR — тільки інформативно. Прибрати `|| true` коли baseline чистий.
+        continue-on-error: true
+
+  syntax-check:
+    # Швидка паралельна перевірка синтаксису всіх .py (без import-тяжких deps)
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: AST parse all .py
+        run: |
+          python - <<'EOF'
+          import ast, os, sys
+          fails = []
+          for root, _, fs in os.walk('.'):
+              if any(x in root for x in ('.git', '__pycache__', 'debug_archive', 'buster_ext')):
+                  continue
+              for f in fs:
+                  if f.endswith('.py'):
+                      p = os.path.join(root, f)
+                      try:
+                          ast.parse(open(p, encoding='utf-8').read())
+                      except SyntaxError as e:
+                          fails.append(f"{p}: {e}")
+          if fails:
+              print("SyntaxError в файлах:")
+              for x in fails: print(" ", x)
+              sys.exit(1)
+          print("OK")
+          EOF

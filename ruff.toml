@@ -1,0 +1,43 @@
+# ruff.toml — лінтер + форматер
+target-version = "py311"
+line-length = 110
+
+exclude = [
+    "debug_archive",
+    "buster_ext",
+    "__pycache__",
+    ".venv",
+    "build",
+    "dist",
+]
+
+[lint]
+# Помірний набір: не захлиснемо технічним боргом, але ловимо реальні проблеми.
+select = [
+    "E",    # pycodestyle errors
+    "F",    # pyflakes (unused imports, undefined names)
+    "W",    # warnings
+    "I",    # isort (порядок імпортів)
+    "UP",   # pyupgrade (старі патерни)
+    "B",    # bugbear (часті баги)
+    "SIM",  # simplify
+    "PIE",  # misc
+    "RUF",  # ruff-specific
+]
+ignore = [
+    "E501",   # line too long (вже maxlen=110, інколи перевищуємо в docstring)
+    "B008",   # function call in default arg (використовуємо Field() у Pydantic)
+    "SIM108", # ternary if-else (не завжди читабельно)
+    "RUF001", # ambiguous Cyrillic characters — ми пишемо українською
+    "RUF002", # те саме в docstrings
+    "RUF003", # те саме в коментарях
+]
+
+[lint.per-file-ignores]
+"test_bot.py" = ["F401", "F811"]  # тести можуть мати невикористані імпорти
+"documents/psd_export.py" = ["T201"]  # CLI-скрипт, print() дозволений
+"scrapers/*.py" = ["E402"]  # scrapers мають top-level side-effects
+
+[format]
+quote-style = "double"
+indent-style = "space"

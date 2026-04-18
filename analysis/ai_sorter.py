@@ -22,6 +22,10 @@ from openai import AsyncOpenAI
 logger = logging.getLogger(__name__)
 load_dotenv("token.env")
 
+# Авторизація: захищаємо всі user-facing хендлери. Імпорт внизу файлу був би
+# чистіший, але декоратори застосовуються над функціями — потрібен зараз.
+from handlers.admin import require_auth  # noqa: E402
+
 
 def _diag_ai(client_id: str, msg: str) -> None:
     """Пише в діагностичний лог doc_analyzer (спільний файл)."""
@@ -879,6 +883,7 @@ def _find_session_dir(code: str) -> str | None:
     return None
 
 
+@require_auth
 async def handle_delivery_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обробляє вибір способу доставки результатів після аналізу."""
     query = update.callback_query
@@ -1070,6 +1075,7 @@ async def handle_delivery_callback(update: Update, context: ContextTypes.DEFAULT
         )
 
 
+@require_auth
 async def cancel_analysis_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обробляє натискання кнопки 'Скасувати аналіз'."""
     query = update.callback_query
@@ -1104,6 +1110,7 @@ async def cancel_analysis_callback(update: Update, context: ContextTypes.DEFAULT
             pass
 
 
+@require_auth
 async def cmd_analysis_logs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Команда /analysislogs — показує лог аналізів (тільки для адміна)."""
     if not update.message:
@@ -1374,6 +1381,7 @@ async def download_from_gdrive(gdrive_url: str, dest_path: str,
     return await asyncio.to_thread(_download)
 
 
+@require_auth
 async def handle_gdrive_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обробляє Google Drive посилання надіслане в чат.Завантажує ZIP і передає в handle_zip_documents_from_path."""
     if not update.message or not update.message.text:
@@ -1832,6 +1840,7 @@ async def _process_zip_file(update: Update, context: ContextTypes.DEFAULT_TYPE,
         shutil.rmtree(work_dir, ignore_errors=True)
 
 
+@require_auth
 async def handle_zip_documents(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Отримує ZIP до 50 МБ через Telegram і запускає аналіз."""
     if not update.message or not update.message.document:
@@ -1867,6 +1876,7 @@ async def handle_zip_documents(update: Update, context: ContextTypes.DEFAULT_TYP
         shutil.rmtree(work_dir, ignore_errors=True)
 
 
+@require_auth
 async def cmd_myresults(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Команда /myresults — показує список сесій з Desktop і дозволяє надіслати будь-яку."""
     if not update.message:
@@ -1971,6 +1981,7 @@ async def run_auto_cleanup() -> None:
         )
 
 
+@require_auth
 async def cmd_cleanup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Команда /cleanup — ручне очищення старих сесій."""
     if not update.message:

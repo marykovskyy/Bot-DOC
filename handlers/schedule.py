@@ -17,6 +17,7 @@ from apscheduler.triggers.cron import CronTrigger
 import database
 from scrapers.main import run_scraping
 from state import scraping_status, _status_lock, _scheduler, _BOT_TZ
+from handlers.admin import require_auth
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +37,7 @@ def get_schedule_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(buttons)
 
 
+@require_auth
 async def cmd_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Команда /schedule — показати заплановані задачі і кнопку видалення."""
     if not update.message or not update.effective_user:
@@ -67,6 +69,7 @@ async def cmd_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 
+@require_auth
 async def handle_schedule_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обробляє вибір розкладу та видалення задачі."""
     query = update.callback_query
@@ -208,6 +211,7 @@ async def send_digest(bot, chat_id: int, hours: int = 24) -> None:
                            parse_mode="Markdown", disable_web_page_preview=True)
 
 
+@require_auth
 async def cmd_digest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Команда /digest [hours] — дайджест нових компаній."""
     if not update.message or not update.effective_user:

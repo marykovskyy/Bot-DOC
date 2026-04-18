@@ -4,6 +4,7 @@ utils.py — Спільні утиліти: retry з exponential backoff, хел
 from __future__ import annotations
 
 import logging
+import random
 import time
 from functools import wraps
 from typing import Tuple, Type
@@ -16,6 +17,7 @@ def with_retry(
     delay: float = 1.5,
     backoff: float = 2.0,
     exceptions: Tuple[Type[BaseException], ...] = (Exception,),
+    jitter: float = 0.25,
 ):
     """
     Декоратор: повторює функцію до max_retries разів при помилці.
@@ -38,11 +40,14 @@ def with_retry(
                 except exceptions as exc:
                     last_exc = exc
                     if attempt < max_retries:
+                        # Jitter ±25% — уникаємо "thundering herd" коли паралельні
+                        # воркери впали одночасно і всі retry-ють в той самий момент.
+                        actual_wait = wait * (1 + random.uniform(-jitter, jitter)) if jitter else wait
                         logger.warning(
                             "[retry %d/%d] %s → %s. Очікуємо %.1f сек...",
-                            attempt, max_retries, func.__name__, exc, wait
+                            attempt, max_retries, func.__name__, exc, actual_wait
                         )
-                        time.sleep(wait)
+                        time.sleep(max(0.0, actual_wait))
                         wait *= backoff
                     else:
                         logger.error(

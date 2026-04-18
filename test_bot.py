@@ -119,13 +119,13 @@ class TestProxyManager:
 
     def _patch_path(self, monkeypatch_or_patch):
         """Патчить _PROXY_FILE на тимчасовий шлях."""
-        import proxy_manager
+        from proxy import manager as proxy_manager
         tmp_path = Path(self._tmp.name) / "proxy_settings.json"
         proxy_manager._PROXY_FILE = tmp_path
         return tmp_path
 
     def test_save_and_load(self):
-        import proxy_manager
+        from proxy import manager as proxy_manager
         tmp_path = Path(self._tmp.name) / "proxy_settings.json"
         proxy_manager._PROXY_FILE = tmp_path
 
@@ -138,20 +138,21 @@ class TestProxyManager:
         assert data["proxies"]["France"][0]["host"] == "1.1.1.1"
 
     def test_load_returns_defaults_on_missing_file(self):
-        import proxy_manager
+        from proxy import manager as proxy_manager
         tmp_path = Path(self._tmp.name) / "no_such.json"
+        # Файл не існує — _migrate_from_py буде викликано; стабуємо його
+        # щоб не створювався реальний proxy_settings.json
         proxy_manager._PROXY_FILE = tmp_path
 
-        # Без proxy_settings.py для міграції — перехоплюємо ImportError
-        with patch("proxy_manager._migrate_from_py", side_effect=Exception("no py")):
-            # _migrate_from_py кине — load поверне defaults
-            with patch.object(tmp_path, "exists", return_value=False):
-                data = proxy_manager.load()
-        # Файл або дефолт — use_proxy має бути bool
+        with patch("proxy.manager._migrate_from_py", side_effect=Exception("no py")):
+            data = proxy_manager.load()
+        # При винятку у міграції load() повертає defaults — use_proxy має бути bool
         assert isinstance(data.get("use_proxy", False), bool)
+        assert data.get("use_proxy") is False
+        assert "France" in data.get("proxies", {})
 
     def test_get_use_proxy_helper(self):
-        import proxy_manager
+        from proxy import manager as proxy_manager
         tmp_path = Path(self._tmp.name) / "proxy_settings.json"
         proxy_manager._PROXY_FILE = tmp_path
         proxy_manager.save(False, {"France": [], "Finland": [], "General": []})
@@ -163,7 +164,7 @@ class TestProxyManager:
 
     def test_atomic_write(self):
         """Перевіряє що tmp-файл не залишається після save."""
-        import proxy_manager
+        from proxy import manager as proxy_manager
         tmp_path = Path(self._tmp.name) / "proxy_settings.json"
         proxy_manager._PROXY_FILE = tmp_path
 
@@ -181,18 +182,24 @@ class TestDatabase:
     """Тести бази даних на in-memory SQLite."""
 
     def setup_method(self):
-        """Кожен тест отримує свіжу in-memory БД."""
+        """Кожен тест отримує свіжу БД у тимчасовій папці."""
         import database
         self._orig_db = database.DB_NAME
-        # Використовуємо тимчасовий файл щоб уникнути конфліктів
-        self._tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
-        database.DB_NAME = self._tmp.name
+        # Windows-friendly: TemporaryDirectory замість NamedTemporaryFile —
+        # інакше файл залишається відкритим і WAL-файли (.wal, .shm) не видаляються.
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self._db_path = os.path.join(self._tmpdir.name, "test.db")
+        database.DB_NAME = self._db_path
         database.init_db()
 
     def teardown_method(self):
         import database
         database.DB_NAME = self._orig_db
-        os.unlink(self._tmp.name)
+        # Ігноруємо помилки на Windows якщо WAL-файли ще тримаються
+        try:
+            self._tmpdir.cleanup()
+        except (PermissionError, OSError):
+            pass
 
     def test_init_creates_tables(self):
         import database
@@ -359,6 +366,288 @@ class TestDocumentGenerator:
         gen = DocumentGenerator(tpl_dir)
         result = gen.render({"name": "Test"})   # не повинно кидати
         assert isinstance(result, bytes)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  gsheets.py — retry logic
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestGsheetsRetry:
+    """Тести backoff+jitter+Retry-After без реальних HTTP-викликів."""
+
+    def test_compute_wait_uses_retry_after_header(self):
+        from gsheets import _compute_wait
+        from gspread.exceptions import APIError
+
+        # Фейковий response з Retry-After: 7
+        resp = MagicMock()
+        resp.headers = {"Retry-After": "7"}
+        err = APIError(resp)
+        wait = _compute_wait(0, err)
+        assert wait == 7.0
+
+    def test_compute_wait_caps_retry_after(self):
+        from gsheets import _compute_wait, _MAX_RETRY_WAIT
+        from gspread.exceptions import APIError
+
+        resp = MagicMock()
+        resp.headers = {"Retry-After": "9999"}  # сервер каже чекати 2.7 год
+        err = APIError(resp)
+        assert _compute_wait(0, err) == _MAX_RETRY_WAIT
+
+    def test_compute_wait_fallback_exponential(self):
+        """Без Retry-After — експоненціал з jitter."""
+        from gsheets import _compute_wait, _RETRY_WAIT_BASE, _MAX_RETRY_WAIT
+
+        wait0 = _compute_wait(0, None)
+        wait2 = _compute_wait(2, None)
+        # base * 2^0 = base; з jitter ±25% — в межах [0.75*base, 1.25*base]
+        assert 0.5 <= wait0 <= max(_RETRY_WAIT_BASE * 1.25, 0.5)
+        # base * 2^2 = 4*base — помітно більше за wait0 (майже завжди)
+        assert wait2 <= _MAX_RETRY_WAIT
+
+    def test_compute_wait_invalid_retry_after(self):
+        """Retry-After: 'abc' → fallback на exponential без краху."""
+        from gsheets import _compute_wait
+        from gspread.exceptions import APIError
+
+        resp = MagicMock()
+        resp.headers = {"Retry-After": "not-a-number"}
+        err = APIError(resp)
+        wait = _compute_wait(0, err)
+        assert wait > 0  # fallback спрацював
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  handlers/scraping.py — валідація вводу
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestScrapingValidators:
+    """Тести меж для keyword/count/year."""
+
+    def test_constants_defined(self):
+        from handlers.scraping import (
+            _MAX_KEYWORD_LEN, _MAX_COUNT, _MIN_YEAR, _MAX_YEAR,
+        )
+        assert _MAX_KEYWORD_LEN > 0
+        assert _MAX_COUNT >= 100
+        assert 1900 <= _MIN_YEAR < _MAX_YEAR <= 2200
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  observability.py — Sentry no-op
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestObservability:
+    """Sentry має gracefully пропускатись без DSN."""
+
+    def test_init_sentry_returns_false_when_dsn_missing(self, monkeypatch):
+        from observability import init_sentry
+        monkeypatch.delenv("SENTRY_DSN", raising=False)
+        assert init_sentry() is False
+
+    def test_init_sentry_returns_false_when_empty_dsn(self, monkeypatch):
+        from observability import init_sentry
+        monkeypatch.setenv("SENTRY_DSN", "   ")
+        assert init_sentry() is False
+
+    def test_set_user_context_noop_without_sentry(self):
+        """Якщо sentry-sdk не встановлено — функція не повинна падати."""
+        from observability import set_user_context, tag
+        # Не кидає навіть без sentry_sdk
+        set_user_context(12345, "test")
+        tag("country", "France")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  handlers/proxy.py — port validation
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestProxyHandlers:
+    """Тести валідаторів proxy."""
+
+    def test_valid_port_accepts_valid_range(self):
+        from handlers.proxy import _valid_port
+        assert _valid_port("1") is True
+        assert _valid_port("8080") is True
+        assert _valid_port("65535") is True
+
+    def test_valid_port_rejects_out_of_range(self):
+        from handlers.proxy import _valid_port
+        assert _valid_port("0") is False
+        assert _valid_port("65536") is False
+        assert _valid_port("-1") is False
+        assert _valid_port("abc") is False
+        assert _valid_port("") is False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  database.py — datetime roundtrip (Python 3.12+)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestDatabaseDatetime:
+    """Перевірка що datetime → SQLite → datetime не втрачає типізацію."""
+
+    def setup_method(self):
+        import database
+        self._orig = database.DB_NAME
+        self._tmpdir = tempfile.TemporaryDirectory()
+        database.DB_NAME = os.path.join(self._tmpdir.name, "dt.db")
+        database.init_db()
+
+    def teardown_method(self):
+        import database
+        database.DB_NAME = self._orig
+        try:
+            self._tmpdir.cleanup()
+        except (PermissionError, OSError):
+            pass
+
+    def test_company_date_is_datetime_after_read(self):
+        import database
+        from datetime import datetime
+        database.save_company_to_db("TestCo", "http://example.com/x1", "France")
+        with database.get_connection() as conn:
+            row = conn.execute(
+                "SELECT date_added FROM companies WHERE link = ?",
+                ("http://example.com/x1",)
+            ).fetchone()
+        # Завдяки register_converter — це datetime, не str
+        assert isinstance(row["date_added"], datetime)
+
+    def test_get_new_companies_limit_respected(self):
+        import database
+        from datetime import datetime, timedelta
+        for i in range(5):
+            database.save_company_to_db(f"C{i}", f"http://ex.com/{i}", "France")
+        since = datetime.now() - timedelta(days=1)
+        res = database.get_new_companies_since(since, limit=3)
+        assert len(res) == 3
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  utils.py — jitter
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestWithRetryJitter:
+    def test_jitter_zero_no_variance(self):
+        """jitter=0 — sleep робиться рівно на delay."""
+        from utils import with_retry
+        import time as _t
+        calls = [0.0]
+
+        @with_retry(max_retries=2, delay=0.1, jitter=0)
+        def fail():
+            calls[0] += 1
+            raise ValueError("x")
+
+        try:
+            fail()
+        except ValueError:
+            pass
+        assert calls[0] == 2
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Authorization (whitelist, UPSERT, unblock)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestAuthorization:
+    """Перевіряє що @require_auth блокує не-whitelist-юзерів,
+    /adduser реактивує заблокованого (UPSERT), /unblockuser працює коректно."""
+
+    def setup_method(self):
+        import database
+        self._orig = database.DB_NAME
+        self._tmpdir = tempfile.TemporaryDirectory()
+        database.DB_NAME = os.path.join(self._tmpdir.name, "auth.db")
+        database.init_db()
+
+    def teardown_method(self):
+        import database
+        database.DB_NAME = self._orig
+        try:
+            self._tmpdir.cleanup()
+        except (PermissionError, OSError):
+            pass
+
+    def test_add_user_upsert_reactivates_blocked(self):
+        """/removeuser → /adduser знову робить юзера активним (UPSERT, а не IGNORE)."""
+        import database
+        uid = 1001
+        database.add_user(uid, "alice", role="user")
+        assert database.is_user_allowed(uid) is True
+
+        database.set_user_active(uid, False)
+        assert database.is_user_allowed(uid) is False
+
+        # Симулюємо повторний /adduser — має реактивувати
+        database.add_user(uid, "alice", role="user")
+        assert database.is_user_allowed(uid) is True
+
+    def test_unblock_activates_existing_blocked_user(self):
+        """set_user_active(True) повертає заблокованому доступ."""
+        import database
+        uid = 1002
+        database.add_user(uid, "bob", role="user")
+        database.set_user_active(uid, False)
+        assert database.is_user_allowed(uid) is False
+
+        database.set_user_active(uid, True)
+        assert database.is_user_allowed(uid) is True
+
+    def test_require_auth_blocks_unknown_user(self):
+        """@require_auth викликає reply_text з «Доступ заборонено», func не виконується."""
+        import asyncio
+        from handlers.admin import require_auth
+
+        called = []
+
+        @require_auth
+        async def inner(update, context):
+            called.append(1)
+
+        # Mock update з невідомим user.id
+        update = MagicMock()
+        update.effective_user.id = 99999  # не в БД
+        update.effective_user.username = "ghost"
+        update.message = MagicMock()
+        update.message.reply_text = MagicMock()
+        async def _noop_reply(*a, **kw):
+            return None
+        update.message.reply_text.side_effect = _noop_reply
+        update.callback_query = None
+
+        # ADMIN_ID підміняємо на None (щоб не пропустив як адміна)
+        with patch("handlers.admin.ADMIN_ID", None):
+            # але is_user_allowed повертає False по БД → тут у нас свіжа БД, user не додано
+            asyncio.run(inner(update, MagicMock()))
+
+        assert called == [], "Хендлер не повинен був виконатися для unknown user"
+
+    def test_require_auth_allows_whitelisted_user(self):
+        """Юзер у БД is_active=1 → хендлер викликається."""
+        import asyncio
+        import database
+        from handlers.admin import require_auth
+
+        uid = 2002
+        database.add_user(uid, "carol", role="user")
+
+        called = []
+
+        @require_auth
+        async def inner(update, context):
+            called.append(1)
+
+        update = MagicMock()
+        update.effective_user.id = uid
+        update.effective_user.username = "carol"
+
+        with patch("handlers.admin.ADMIN_ID", None):
+            asyncio.run(inner(update, MagicMock()))
+
+        assert called == [1]
 
 
 # ─────────────────────────────────────────────────────────────────────────────

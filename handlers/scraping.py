@@ -9,14 +9,22 @@ from telegram.ext import ContextTypes, ConversationHandler
 import database
 from config import ADMIN_ID
 from scrapers.main import run_scraping
+from constants import STATUS_UPDATE_SEC
 from state import (
     scraping_status, _status_lock, MAX_PARALLEL_TASKS,
     SELECT_SITE, TYPING_KEYWORD, TYPING_COUNT, TYPING_YEAR, SELECT_FORMAT, SELECT_UK_MODE
 )
+
+# ── Межі валідації ────────────────────────────────────────────────────────
+_MAX_KEYWORD_LEN  = 200    # максимальна довжина одного keyword
+_MAX_COUNT        = 1000   # максимум компаній за один пошук
+_MIN_YEAR         = 1900   # нижня межа валідації року
+_MAX_YEAR         = 2100   # верхня межа валідації року
 from keyboards import (
     get_sites_kb, get_back_kb, get_formats_kb, get_uk_mode_kb,
     get_main_panel, get_stop_kb, get_schedule_kb
 )
+from handlers.admin import require_auth
 
 logger = logging.getLogger(__name__)
 
@@ -30,12 +38,15 @@ def get_progress_bar(current: int, total: int, length: int = 12) -> str:
     return f"`[{bar}] {percent}%`"
 
 
-async def safe_answer(query) -> None:
+async def safe_answer(query, text: str | None = None, show_alert: bool = False) -> None:
     if query:
         try:
-            await query.answer()
-        except Exception:
-            pass
+            if text:
+                await query.answer(text=text, show_alert=show_alert)
+            else:
+                await query.answer()
+        except Exception as e:
+            logger.debug("safe_answer: %s", e)
 
 
 async def safe_edit(query, text: str, reply_markup=None) -> None:
@@ -47,20 +58,12 @@ async def safe_edit(query, text: str, reply_markup=None) -> None:
             pass
 
 
+@require_auth
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Перевірка доступу — через @require_auth (декоратор бере на себе whitelist
+    # + автододавання адміна + повідомлення "Доступ заборонено"). Ручну
+    # дубльовану перевірку прибрано як пункт аудиту безпеки.
     if not update.message or context.user_data is None:
-        return ConversationHandler.END
-    user = update.effective_user
-    # Адмін автоматично в whitelist
-    if user and ADMIN_ID and user.id == ADMIN_ID:
-        database.add_user(user.id, user.username or "", role="admin")
-    # Перевірка доступу
-    if user and not database.is_user_allowed(user.id):
-        await update.message.reply_text(
-            f"⛔️ **Доступ заборонено**\n\nТвій ID: `{user.id}`\n"
-            "Зверніться до адміністратора.",
-            parse_mode="Markdown"
-        )
         return ConversationHandler.END
     context.user_data.clear()
     await update.message.reply_text("🤖 Робоча панель активована.", reply_markup=get_main_panel())
@@ -85,6 +88,17 @@ async def save_kw(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text or context.user_data is None:
         return TYPING_KEYWORD
     raw_kw = update.message.text.strip()
+
+    # ── Валідація: довжина ─────────────────────────────────────────
+    if not raw_kw:
+        await update.message.reply_text("❌ Ключове слово не може бути порожнім.")
+        return TYPING_KEYWORD
+    if len(raw_kw) > _MAX_KEYWORD_LEN:
+        await update.message.reply_text(
+            f"❌ Ключ занадто довгий: {len(raw_kw)} символів. Максимум: {_MAX_KEYWORD_LEN}."
+        )
+        return TYPING_KEYWORD
+
     context.user_data['kw'] = raw_kw
 
     # Підтримка кількох ключових слів через кому
@@ -110,7 +124,17 @@ async def save_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message.text.isdigit():
         await update.message.reply_text("❌ Будь ласка, введіть число (наприклад: 50).")
         return TYPING_COUNT
-    context.user_data['count'] = update.message.text
+    try:
+        count_val = int(update.message.text)
+    except ValueError:
+        await update.message.reply_text("❌ Невірний формат числа.")
+        return TYPING_COUNT
+    if not (1 <= count_val <= _MAX_COUNT):
+        await update.message.reply_text(
+            f"❌ Кількість має бути від 1 до {_MAX_COUNT}. Ви ввели: {count_val}."
+        )
+        return TYPING_COUNT
+    context.user_data['count'] = str(count_val)
     await update.message.reply_text(
         "📅 **Починаючи з якого року реєстрації шукати компанії?**\n\n"
         "Введіть рік (наприклад: `2022`) — бот знайде компанії за **2022, 2023, 2024...** і далі.\n"
@@ -133,6 +157,15 @@ async def save_year(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
         return TYPING_YEAR
+
+    # ── Валідація діапазону року ──────────────────────────────────
+    if raw != "0":
+        year_val = int(raw)
+        if not (_MIN_YEAR <= year_val <= _MAX_YEAR):
+            await update.message.reply_text(
+                f"❌ Рік має бути в діапазоні {_MIN_YEAR}–{_MAX_YEAR}. Ви ввели: {year_val}."
+            )
+            return TYPING_YEAR
 
     context.user_data['target_year'] = raw
 
@@ -334,7 +367,7 @@ async def status_updater(context: ContextTypes.DEFAULT_TYPE, chat_id: int, messa
             except Exception:
                 pass
 
-        await asyncio.sleep(3)
+        await asyncio.sleep(STATUS_UPDATE_SEC)
 
     # ── Фінальний стан: читаємо і видаляємо атомарно ──
     async with _status_lock:
@@ -378,7 +411,10 @@ async def status_updater(context: ContextTypes.DEFAULT_TYPE, chat_id: int, messa
             )
 
 
+@require_auth
 async def repeat_search_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # @require_auth сам обробляє callback-query: якщо доступу немає,
+    # робить query.answer("Доступ заборонено", show_alert=True) і return.
     query = update.callback_query
     if not query or not update.effective_chat or context.user_data is None:
         return ConversationHandler.END
