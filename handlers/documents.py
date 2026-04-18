@@ -38,6 +38,7 @@ from documents.generator import (
 )
 from documents.translit import transliterate_if_needed
 from documents.random_person import generate_person
+from handlers.admin import require_auth
 
 logger = logging.getLogger(__name__)
 
@@ -209,6 +210,7 @@ def _build_summary(context: ContextTypes.DEFAULT_TYPE) -> str:
 #  ЕКРАН 1 — Головне меню генератора
 # ─────────────────────────────────────────────
 
+@require_auth
 async def show_doc_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     names = list_templates()
     count = len(names)
@@ -903,6 +905,7 @@ async def _generate_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE,
 #  BATCH — генерація з CSV/Excel
 # ─────────────────────────────────────────────
 
+@require_auth
 async def handle_batch_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Обробляє завантажений CSV/Excel для batch-генерації."""
     if not update.message or not update.message.document:
@@ -1033,6 +1036,7 @@ def _clear_doc_state(context: ContextTypes.DEFAULT_TYPE) -> None:
 #  Адмін: превью шаблону
 # ─────────────────────────────────────────────
 
+@require_auth
 async def cmd_preview_template(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
@@ -1076,6 +1080,7 @@ async def cmd_preview_template(update: Update, context: ContextTypes.DEFAULT_TYP
 #  Швидка команда /quickdoc
 # ─────────────────────────────────────────────
 
+@require_auth
 async def cmd_quickdoc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/quickdoc <шаблон> <прізвище> <ім'я> <дата_народж> <стать> [місце_народж]
 

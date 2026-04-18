@@ -48,6 +48,7 @@ def require_auth(func):
     return wrapper
 
 
+@require_auth
 async def show_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     db_stats = database.get_global_stats()
 
@@ -65,7 +66,7 @@ async def show_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         if db_stats['by_country']:
             text += "📊 **По країнах:**\n"
             for country, count in db_stats['by_country']:
-                flag = flags.get(country, "📍")
+                flag = COUNTRY_FLAGS.get(country, "📍")
                 text += f"{flag} {country}: **{count}**\n"
     else:
         text += "_⚠️ Глобальна статистика наразі недоступна._"
@@ -362,13 +363,14 @@ async def cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not users:
         await update.message.reply_text("📋 Список користувачів порожній.")
         return
-    lines = ["👥 **Список користувачів:**\n"]
+    from html import escape as _h_escape
+    lines = ["👥 <b>Список користувачів:</b>\n"]
     for u in users:
         role_icon = "👑" if u["role"] == "admin" else "👤"
         status = "🟢" if u["is_active"] else "🔴"
-        username = f"@{u['username']}" if u["username"] else "—"
-        lines.append(f"{status} {role_icon} `{u['chat_id']}` {username} — _{u['role']}_")
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+        username = f"@{_h_escape(u['username'])}" if u["username"] else "—"
+        lines.append(f"{status} {role_icon} <code>{u['chat_id']}</code> {username} — <i>{_h_escape(u['role'])}</i>")
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
 async def cmd_adduser(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -408,16 +410,63 @@ async def cmd_removeuser(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
     try:
         target_id = int(args[0])
+        # Захист від самоблокування адміна
+        admin_user = update.effective_user
+        if admin_user and target_id == admin_user.id:
+            await update.message.reply_text("⚠️ Не можна заблокувати сам себе.")
+            return
         database.set_user_active(target_id, False)
         await update.message.reply_text(f"🚫 Користувача `{target_id}` заблоковано.", parse_mode="Markdown")
     except ValueError:
         await update.message.reply_text("❌ Невірний chat_id.")
 
 
+async def cmd_unblockuser(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Команда /unblockuser <chat_id> — розблокувати раніше заблокованого юзера.
+
+    Сематично відрізняється від /adduser: не створює нових юзерів, тільки
+    реактивує існуючих у whitelist. Якщо юзера взагалі нема в БД — повідомляє.
+    """
+    if not update.message or not is_admin(update):
+        if update.message:
+            await update.message.reply_text("⛔️ Тільки для адміна.")
+        return
+    args = context.args or []
+    if not args:
+        await update.message.reply_text(
+            "Використання: `/unblockuser <chat_id>`", parse_mode="Markdown"
+        )
+        return
+    try:
+        target_id = int(args[0])
+    except ValueError:
+        await update.message.reply_text("❌ Невірний chat_id.")
+        return
+
+    user = database.get_user(target_id)
+    if user is None:
+        await update.message.reply_text(
+            f"⚠️ Користувача `{target_id}` немає в БД. "
+            "Використайте `/adduser` щоб додати нового.",
+            parse_mode="Markdown"
+        )
+        return
+    if bool(user["is_active"]):
+        await update.message.reply_text(
+            f"ℹ️ Користувач `{target_id}` вже активний.", parse_mode="Markdown"
+        )
+        return
+    database.set_user_active(target_id, True)
+    await update.message.reply_text(
+        f"✅ Користувача `{target_id}` розблоковано.", parse_mode="Markdown"
+    )
+
+
 # ─────────────────────────────────────────────
 #  ІСТОРІЯ ПОШУКІВ
 # ─────────────────────────────────────────────
 
+@require_auth
 async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Команда /history — останні 10 пошуків користувача."""
     if not update.message or not update.effective_user:
@@ -430,24 +479,28 @@ async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     lines = ["📋 **Останні пошуки:**\n"]
     buttons = []
+    from html import escape as _h_escape
     for i, h in enumerate(history, 1):
-        flag = {"France": "🇫🇷", "Finland": "🇫🇮", "Denmark": "🇩🇰",
-                "California": "🇺🇸", "UnitedKingdom": "🇬🇧", "Latvia": "🇱🇻",
-                "NewZealand": "🇳🇿", "Thailand": "🇹🇭", "CzechRepublic": "🇨🇿"}.get(h["site"], "📍")
+        flag = COUNTRY_FLAGS.get(h["site"], "📍")
         dt = h["started_at"][:16] if h["started_at"] else "—"
-        lines.append(f"`{i}.` {flag} **{h['site']}** — `{h['keyword']}` x{h['count']} [{dt}]")
+        kw_safe = _h_escape(str(h['keyword']))
+        site_safe = _h_escape(str(h['site']))
+        lines.append(f"<code>{i}.</code> {flag} <b>{site_safe}</b> — <code>{kw_safe}</code> x{h['count']} [{dt}]")
+        # Кнопка: обрізаємо keyword до 30 символів щоб не вийти за ліміт callback (64 байти запас для "repeat_<id>")
+        btn_label = f"🔄 #{i}: {h['site']} / {str(h['keyword'])[:30]}"
         buttons.append([InlineKeyboardButton(
-            f"🔄 #{i}: {h['site']} / {h['keyword']}",
+            btn_label,
             callback_data=f"repeat_{h['id']}"
         )])
 
     await update.message.reply_text(
         "\n".join(lines),
-        parse_mode="Markdown",
+        parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(buttons)
     )
 
 
+@require_auth
 async def repeat_from_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Callback: повторити пошук з історії."""
     import asyncio
@@ -463,7 +516,11 @@ async def repeat_from_history(update: Update, context: ContextTypes.DEFAULT_TYPE
     from handlers.scraping import safe_answer
     await safe_answer(query)
 
-    history_id = int(query.data.replace("repeat_", ""))
+    try:
+        history_id = int(query.data.replace("repeat_", ""))
+    except (ValueError, TypeError):
+        await safe_answer(query, "❌ Невірний ID", show_alert=True)
+        return
     chat_id = update.effective_user.id
     history = database.get_search_history(chat_id, limit=50)
     item = next((h for h in history if h["id"] == history_id), None)

@@ -1,12 +1,31 @@
 import sqlite3
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from contextlib import contextmanager
 
 logger = logging.getLogger(__name__)
 
 DB_NAME = "companies.db"
 _CONNECT_TIMEOUT = 15.0
+
+
+# ── Адаптери datetime для SQLite (Python 3.12+ прибрав неявні конвертери) ─
+# Без цього отримаємо DeprecationWarning. Формат ISO — сумісний з існуючими
+# даними `datetime.now()`: "2026-04-18 12:34:56.789".
+def _adapt_datetime(dt: datetime) -> str:
+    return dt.isoformat(sep=" ")
+
+
+def _convert_datetime(b: bytes) -> datetime:
+    try:
+        return datetime.fromisoformat(b.decode())
+    except ValueError:
+        # Fallback для старих записів у неочікуваному форматі
+        return datetime.strptime(b.decode(), "%Y-%m-%d %H:%M:%S")
+
+
+sqlite3.register_adapter(datetime, _adapt_datetime)
+sqlite3.register_converter("TIMESTAMP", _convert_datetime)
 
 
 def _apply_pragmas(conn: sqlite3.Connection) -> None:
@@ -39,7 +58,12 @@ def _apply_pragmas(conn: sqlite3.Connection) -> None:
 
 @contextmanager
 def get_connection():
-    conn = sqlite3.connect(DB_NAME, timeout=_CONNECT_TIMEOUT, check_same_thread=False)
+    conn = sqlite3.connect(
+        DB_NAME,
+        timeout=_CONNECT_TIMEOUT,
+        check_same_thread=False,
+        detect_types=sqlite3.PARSE_DECLTYPES,  # конвертує TIMESTAMP ← converter
+    )
     conn.row_factory = sqlite3.Row
     _apply_pragmas(conn)
     try:
@@ -55,7 +79,7 @@ def get_connection():
 # ── Версія схеми БД ──────────────────────────────────────────────────────────
 # Збільшуйте цей лічильник кожен раз коли додаєте нову міграцію в _run_migrations().
 # SQLite зберігає поточну версію в PRAGMA user_version.
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 
 
 def _run_migrations(conn: sqlite3.Connection) -> None:
@@ -83,14 +107,33 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
     if current_version < 1:
         # Тут можна додати ALTER TABLE для існуючих таблиць якщо потрібно.
         # Наприклад: conn.execute("ALTER TABLE companies ADD COLUMN category TEXT DEFAULT ''")
-        conn.execute(f"PRAGMA user_version = 1")
+        conn.execute("PRAGMA user_version = 1")
         logger.info("Міграція до версії 1 виконана.")
 
-    # ── Версія 1 → 2: приклад майбутньої міграції ──
-    # if current_version < 2:
-    #     conn.execute("ALTER TABLE users ADD COLUMN last_active TIMESTAMP")
-    #     conn.execute("PRAGMA user_version = 2")
-    #     logger.info("Міграція до версії 2 виконана.")
+    # ── Версія 1 → 2: композитні індекси для швидкості запитів ──
+    if current_version < 2:
+        # search_history: історія юзера сортована за часом
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_search_hist_chat_time "
+            "ON search_history (chat_id, started_at DESC)"
+        )
+        # scheduled_tasks: активні задачі юзера
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sched_active_chat "
+            "ON scheduled_tasks (chat_id, is_active)"
+        )
+        # doc_analysis_log: останні логи для адміна
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_doc_log_time "
+            "ON doc_analysis_log (started_at DESC)"
+        )
+        # companies: групування за країною (для статистики)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_companies_country "
+            "ON companies (country)"
+        )
+        conn.execute("PRAGMA user_version = 2")
+        logger.info("Міграція до версії 2 виконана (композитні індекси).")
 
 
 def init_db() -> None:
@@ -217,6 +260,11 @@ def is_company_name_scraped(name: str) -> bool:
 
 
 def save_company_to_db(name: str, link: str, country: str) -> bool:
+    """Зберігає компанію. True — новий запис, False — дубль або помилка БД.
+
+    IntegrityError — очікуваний дубль по UNIQUE(link), не логуємо як помилку.
+    OperationalError — проблема з БД (locked, disk full…), логуємо як warning.
+    """
     try:
         with get_connection() as conn:
             conn.execute(
@@ -225,9 +273,11 @@ def save_company_to_db(name: str, link: str, country: str) -> bool:
             )
         return True
     except sqlite3.IntegrityError:
+        # Дубль по UNIQUE(link) — це очікувана ситуація (скрапер перевіряє поточну сторінку).
         return False
     except sqlite3.OperationalError as e:
-        logger.warning("SQLite OperationalError: %s", e)
+        # locked / disk I/O — потенційно транзиторна помилка.
+        logger.warning("SQLite OperationalError при збереженні компанії '%s': %s", name, e)
         return False
 
 
@@ -238,10 +288,13 @@ def get_global_stats() -> dict | None:
             by_country = conn.execute(
                 "SELECT country, COUNT(*) FROM companies GROUP BY country"
             ).fetchall()
-            today_str = datetime.now().strftime('%Y-%m-%d')
+            # Діапазонний пошук швидший за LIKE (використовує idx_date_added).
+            now = datetime.now()
+            day_start = datetime(now.year, now.month, now.day)
+            day_end = day_start + timedelta(days=1)
             today = conn.execute(
-                "SELECT COUNT(*) FROM companies WHERE date_added LIKE ?",
-                (f"{today_str}%",)
+                "SELECT COUNT(*) FROM companies WHERE date_added >= ? AND date_added < ?",
+                (day_start, day_end)
             ).fetchone()[0]
         return {"total": total, "by_country": by_country, "today": today}
     except Exception as e:
@@ -249,12 +302,16 @@ def get_global_stats() -> dict | None:
         return None
 
 
-def get_new_companies_since(since: datetime) -> list[dict]:
-    """Повертає компанії додані після вказаного часу (для дайджесту)."""
+def get_new_companies_since(since: datetime, limit: int = 10000) -> list[dict]:
+    """Повертає компанії додані після вказаного часу (для дайджесту).
+
+    LIMIT захищає від випадкового OOM коли since=дуже давно.
+    """
     with get_connection() as conn:
         rows = conn.execute(
-            "SELECT name, link, country FROM companies WHERE date_added >= ? ORDER BY date_added DESC",
-            (since,)
+            "SELECT name, link, country FROM companies WHERE date_added >= ? "
+            "ORDER BY date_added DESC LIMIT ?",
+            (since, limit)
         ).fetchall()
     return [dict(r) for r in rows]
 
@@ -284,10 +341,27 @@ def get_user_role(chat_id: int) -> str:
 
 
 def add_user(chat_id: int, username: str, role: str = "user") -> bool:
+    """Додає юзера або реактивує існуючого.
+
+    Семантика:
+      - Якщо юзер не існує → INSERT (новий запис, is_active=1)
+      - Якщо юзер існує (навіть заблокований) → UPDATE: активуємо, оновлюємо
+        username, role залишаємо без змін (не даунгрейдимо адміна до user).
+
+    Раніше було INSERT OR IGNORE — команда /adduser НЕ реактивувала
+    заблокованих юзерів, що суперечило очікуваній семантиці.
+    """
     try:
         with get_connection() as conn:
+            # UPSERT: SQLite 3.24+ (Python 3.11 гарантовано має)
             conn.execute(
-                "INSERT OR IGNORE INTO users (chat_id, username, role) VALUES (?, ?, ?)",
+                """
+                INSERT INTO users (chat_id, username, role, is_active)
+                VALUES (?, ?, ?, 1)
+                ON CONFLICT(chat_id) DO UPDATE SET
+                    username  = excluded.username,
+                    is_active = 1
+                """,
                 (chat_id, username or "", role)
             )
         return True
@@ -378,12 +452,13 @@ def get_scheduled_tasks(chat_id: int | None = None) -> list[dict]:
 
 
 def delete_scheduled_task(task_id: int, chat_id: int) -> bool:
+    """Деактивує задачу. Повертає True якщо реально було оновлено рядок."""
     with get_connection() as conn:
-        conn.execute(
-            "UPDATE scheduled_tasks SET is_active = 0 WHERE id = ? AND chat_id = ?",
+        cur = conn.execute(
+            "UPDATE scheduled_tasks SET is_active = 0 WHERE id = ? AND chat_id = ? AND is_active = 1",
             (task_id, chat_id)
         )
-    return True
+        return cur.rowcount > 0
 
 
 def update_task_last_run(task_id: int) -> None:

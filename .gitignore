@@ -2,11 +2,14 @@
 token.env
 .env
 credentials.json
+proxy/settings.py
 proxy_settings.py
-.env.example
+proxy_settings.json
+# .env.example має бути в git як шаблон з плейсхолдерами (БЕЗ реальних ключів)
 
 # Локальні дані
 companies.db
+bot_database.db
 uk_reports/
 turkey_reports/
 
@@ -24,7 +27,9 @@ buster_ext/
 # Результати і звіти
 results/
 *.xlsx
-*.txt
+companies.txt
+GUIDE.txt
+Текстовый документ.txt
 
 # Шаблони документів (PSD і PNG)
 templates/
@@ -35,3 +40,8 @@ templates/
 
 # Логи
 *.log
+logs/
+
+# Debug-артефакти
+nz_error_report.png
+nz_timeout_debug.png

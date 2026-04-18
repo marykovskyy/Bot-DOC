@@ -1,16 +1,20 @@
 """
 bot.py — Точка входу бота. Реєстрація хендлерів та запуск.
 
-Архітектура модулів:
-  state.py             — спільний стан (scraping_status, _status_lock, _scheduler…)
-  keyboards.py         — фабрики клавіатур
-  handlers_scraping.py — ConversationHandler (пошук компаній)
-  handlers_proxy.py    — управління проксі
-  handlers_admin.py    — авторизація, /users, /adduser, /removeuser, /history, довідка
-  handlers_schedule.py — планувальник, /schedule, /digest
-  handlers_misc.py     — /status, health-check HTTP, /restart
+Архітектура модулів (пакет handlers/):
+  state.py              — спільний стан (scraping_status, _status_lock, _scheduler…)
+  keyboards.py          — фабрики клавіатур
+  handlers/scraping.py  — ConversationHandler (пошук компаній)
+  handlers/proxy.py     — управління проксі
+  handlers/admin.py     — авторизація, /users, /adduser, /removeuser, /history, довідка
+  handlers/schedule.py  — планувальник, /schedule, /digest
+  handlers/misc.py      — /status, health-check HTTP, /restart
+  handlers/documents.py — AI-генерація документів
 """
 import logging
+import sys
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
 
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler,
@@ -18,6 +22,7 @@ from telegram.ext import (
 )
 
 from config import TOKEN
+from observability import init_sentry
 import database
 from state import _scheduler
 from analysis.ai_sorter import (
@@ -39,7 +44,7 @@ from handlers.proxy import (
 from handlers.admin import (
     is_admin, require_auth,
     show_stats, show_help, help_section_callback,
-    cmd_users, cmd_adduser, cmd_removeuser,
+    cmd_users, cmd_adduser, cmd_removeuser, cmd_unblockuser,
     cmd_history, repeat_from_history,
 )
 from handlers.schedule import (
@@ -58,14 +63,39 @@ from state import (
     TYPING_YEAR, SELECT_FORMAT, SELECT_UK_MODE,
 )
 
-logging.basicConfig(format='%(asctime)s [%(levelname)s] %(message)s', level=logging.INFO)
+# ── Логування: stdout + RotatingFileHandler ───────────────────────────────
+_LOG_DIR = Path(__file__).parent / "logs"
+_LOG_DIR.mkdir(exist_ok=True)
+_LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+_log_formatter = logging.Formatter(_LOG_FORMAT)
+
+_root = logging.getLogger()
+_root.setLevel(logging.INFO)
+# stdout handler
+_stream_h = logging.StreamHandler()
+_stream_h.setFormatter(_log_formatter)
+_root.addHandler(_stream_h)
+# rotating file handler: 10 MB × 5 файлів
+_file_h = RotatingFileHandler(
+    _LOG_DIR / "bot.log",
+    maxBytes=10 * 1024 * 1024,
+    backupCount=5,
+    encoding="utf-8",
+)
+_file_h.setFormatter(_log_formatter)
+_root.addHandler(_file_h)
+
 logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("apscheduler").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 
 def main() -> None:
     if not TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN не знайдено в .env!")
+
+    # Sentry (опціонально — no-op якщо SENTRY_DSN не заданий)
+    init_sentry()
 
     app = (ApplicationBuilder()
            .token(TOKEN)             # type: ignore[arg-type]
@@ -85,8 +115,18 @@ def main() -> None:
     # Примітка: "🪪 Документи" обробляється всередині build_doc_conversation() (entry_point)
 
     # ── Проксі ──
-    app.add_handler(MessageHandler(filters.Regex(r".+:.+:.+:.+"), auto_update_proxy))
-    app.add_handler(MessageHandler(filters.Document.FileExtension("txt"), handle_proxy_file))
+    # Звужений regex: host:port:user:pass (host — IPv4 або domain, port — тільки цифри).
+    # Раніше `.+:.+:.+:.+` перехоплював будь-яке повідомлення з 3+ двокрапками
+    # і ламав ConversationHandler-стани типу TYPING_KEYWORD.
+    # group=1 — щоб ConversationHandler (group=0) мав пріоритет при активній розмові.
+    app.add_handler(
+        MessageHandler(
+            filters.Regex(r"^[\w.\-]+:\d{1,5}:[^\s:]+:[^\s:]+$"),
+            auto_update_proxy
+        ),
+        group=1
+    )
+    app.add_handler(MessageHandler(filters.Document.FileExtension("txt"), handle_proxy_file), group=1)
     app.add_handler(CallbackQueryHandler(
         proxy_callback_handler,
         pattern=r"^(toggle_proxy|close_proxy|proxy_upload_info|proxy_clear|proxy_back"
@@ -125,6 +165,7 @@ def main() -> None:
     app.add_handler(CommandHandler("users",        cmd_users))
     app.add_handler(CommandHandler("adduser",      cmd_adduser))
     app.add_handler(CommandHandler("removeuser",   cmd_removeuser))
+    app.add_handler(CommandHandler("unblockuser",  cmd_unblockuser))
     app.add_handler(CommandHandler("myresults",    cmd_myresults))
     app.add_handler(CommandHandler("analysislogs", cmd_analysis_logs))
     app.add_handler(CommandHandler("cleanup",      cmd_cleanup))
@@ -196,4 +237,5 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         logger.info("Бот зупинений користувачем.")
     except Exception as e:
-        logger.critical("Помилка при запуску: %s", e)
+        logger.critical("Помилка при запуску: %s", e, exc_info=True)
+        sys.exit(1)  # systemd/docker розуміє код != 0 як помилку і зробить restart

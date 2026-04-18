@@ -1,0 +1,35 @@
+# Встановлення:
+#   pip install pre-commit
+#   pre-commit install
+#
+# Хуки запускаються автоматично перед git commit.
+# Ручний запуск: pre-commit run --all-files
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-json
+      - id: check-added-large-files
+        args: [--maxkb=1024]
+      - id: check-merge-conflict
+      - id: detect-private-key
+      - id: debug-statements  # блокує pdb.set_trace()
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.5.0
+    hooks:
+      - id: ruff
+        args: [--fix, --exit-non-zero-on-fix]
+      - id: ruff-format
+
+  - repo: local
+    hooks:
+      - id: no-print-in-bot
+        name: "Блокувати print() у bot/handlers/scrapers"
+        entry: python -c "import sys; sys.exit(0 if all('print(' not in open(f,encoding='utf-8').read() for f in sys.argv[1:]) else 1)"
+        language: system
+        files: ^(bot\.py|handlers/|scrapers/(main|finland|france)\.py)
+        types: [python]

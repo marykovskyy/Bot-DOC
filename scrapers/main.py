@@ -42,6 +42,11 @@ import queue
 _sheets_queue: queue.Queue = queue.Queue()
 _SHEETS_WRITE_DELAY = SHEETS_WRITE_DELAY  # секунд між записами (ліміт Sheets ~60 req/min)
 
+# Worker-thread створюється лінь (lazy) — при першому виклику _enqueue_sheet_write().
+# Уникаємо side-effect при import (тести, import-only сценарії, reload).
+_sheets_thread: threading.Thread | None = None
+_sheets_thread_lock = threading.Lock()
+
 
 def _sheets_worker() -> None:
     """Фоновий потік: бере завдання з черги і пише в Sheets по одному."""
@@ -60,13 +65,22 @@ def _sheets_worker() -> None:
             time.sleep(_SHEETS_WRITE_DELAY)
 
 
-# Запускаємо один постійний потік-воркер (daemon — не блокує завершення процесу)
-_sheets_thread = threading.Thread(target=_sheets_worker, daemon=True)
-_sheets_thread.start()
+def _ensure_sheets_worker() -> None:
+    """Lazy-старт sheets воркера. Thread-safe через DCL-pattern під локом."""
+    global _sheets_thread
+    if _sheets_thread is not None and _sheets_thread.is_alive():
+        return
+    with _sheets_thread_lock:
+        if _sheets_thread is None or not _sheets_thread.is_alive():
+            _sheets_thread = threading.Thread(
+                target=_sheets_worker, daemon=True, name="sheets-worker"
+            )
+            _sheets_thread.start()
 
 
 def _enqueue_sheet_write(name: str, link: str, site_key: str) -> None:
     """Ставить запис у чергу. Повертається одразу, не блокує скрапер."""
+    _ensure_sheets_worker()
     _sheets_queue.put((name, link, site_key))
 
 
@@ -120,6 +134,8 @@ class LocalProxyRelay:
         self.local_port = self._free_port()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._server = None
+        self._thread: Optional[threading.Thread] = None
+        self._stopped = False
 
     @staticmethod
     def _free_port() -> int:
@@ -239,9 +255,14 @@ class LocalProxyRelay:
                                             upstream_r, upstream_w)
 
         except asyncio.TimeoutError:
-            logger.debug("Proxy relay timeout")
+            logger.warning("Proxy relay timeout (upstream=%s:%d)",
+                           self.upstream_host, self.upstream_port)
+        except (ConnectionResetError, BrokenPipeError):
+            # Клієнт/upstream різко закрив сокет — звичайний випадок, DEBUG
+            logger.debug("Proxy relay: connection reset")
         except Exception as exc:
-            logger.debug("Proxy relay error: %s", exc)
+            logger.warning("Proxy relay error (upstream=%s:%d): %s",
+                           self.upstream_host, self.upstream_port, exc)
         finally:
             for w in (upstream_w, client_w):
                 if w is not None:
@@ -261,15 +282,28 @@ class LocalProxyRelay:
                 self._handle, "127.0.0.1", self.local_port
             )
             started_event.set()   # сигналізуємо що сервер готовий
-            await self._server.serve_forever()
+            try:
+                await self._server.serve_forever()
+            except asyncio.CancelledError:
+                pass
 
-        self._loop.run_until_complete(_boot())
+        try:
+            self._loop.run_until_complete(_boot())
+        except (RuntimeError, asyncio.CancelledError):
+            # loop.stop() перериває run_until_complete — це очікувано
+            pass
+        finally:
+            # Закриваємо loop щоб звільнити IOCP/epoll handle.
+            try:
+                self._loop.close()
+            except Exception:
+                pass
 
     def start(self) -> int:
         """Запускає relay і чекає поки він буде готовий. Повертає порт."""
         ready = threading.Event()
-        t = threading.Thread(target=self._run_loop, args=(ready,), daemon=True)
-        t.start()
+        self._thread = threading.Thread(target=self._run_loop, args=(ready,), daemon=True)
+        self._thread.start()
         # Чекаємо реального старту сервера (не просто sleep)
         if not ready.wait(timeout=5.0):
             raise RuntimeError("LocalProxyRelay не запустився за 5 секунд")
@@ -278,11 +312,55 @@ class LocalProxyRelay:
         return self.local_port
 
     def stop(self) -> None:
-        """Зупиняє relay."""
-        if self._loop and self._loop.is_running():
-            if self._server:
-                self._loop.call_soon_threadsafe(self._server.close)
-            self._loop.call_soon_threadsafe(self._loop.stop)
+        """Зупиняє relay із повним cleanup.
+
+        Послідовність (audit finding P3):
+         1. server.close() + wait_closed() — закриває listening socket
+         2. Скасовує всі активні _handle-tasks — звільняє відкриті upstream з'єднання
+         3. loop.stop() — перериває serve_forever
+         4. thread.join() — чекаємо поки потік реально завершиться
+         5. loop.close() — виконується у finally _run_loop (звільняє epoll/IOCP)
+        """
+        if self._stopped:
+            return
+        self._stopped = True
+
+        if not self._loop or not self._loop.is_running():
+            return
+
+        async def _shutdown():
+            # 1. Закриваємо listening socket
+            if self._server is not None:
+                try:
+                    self._server.close()
+                    await self._server.wait_closed()
+                except Exception as e:
+                    logger.debug("relay.stop: server.close error: %s", e)
+            # 2. Скасовуємо всі активні tasks окрім поточного
+            current = asyncio.current_task()
+            for task in asyncio.all_tasks(self._loop):
+                if task is not current and not task.done():
+                    task.cancel()
+
+        try:
+            # Даємо shutdown коротко виконатися, потім зупиняємо loop
+            fut = asyncio.run_coroutine_threadsafe(_shutdown(), self._loop)
+            try:
+                fut.result(timeout=3.0)
+            except Exception as e:
+                logger.debug("relay.stop: shutdown coro: %s", e)
+        finally:
+            try:
+                self._loop.call_soon_threadsafe(self._loop.stop)
+            except Exception:
+                pass
+
+        # 4. Чекаємо завершення потоку (коротко)
+        if self._thread is not None:
+            self._thread.join(timeout=3.0)
+            if self._thread.is_alive():
+                logger.warning("LocalProxyRelay thread не завершився за 3с (port=%d)",
+                               self.local_port)
 
 
 def get_page(chat_id: int, status_dict: dict, site_key: str = "General") -> tuple[Optional[ChromiumPage], Optional["LocalProxyRelay"]]:
@@ -491,47 +569,8 @@ def _run_simple_scraper(scraper_fn, args_builder, page, keyword: str,
 # з france_scraper.py (JSON API pappers.ai, без браузера)
 
 
-def scrape_finland(page: ChromiumPage, config: dict, keyword: str, seen_links: Set[str]) -> List[str]:
-    url = config["search_url"].format(kw=keyword)
-    logger.info("Фінляндія: %s", url)
-    page.get(url)
-    check_and_wait_for_captcha(page)
-
-    unique_results: List[str] = []
-    try:
-        for _ in range(ELEMENT_WAIT_RETRIES):
-            if page.ele('tag:table'):
-                break
-            time.sleep(1)
-        else:
-            logger.warning("Таблицю Фінляндії не знайдено.")
-            return unique_results
-
-        page.scroll.to_bottom()
-        time.sleep(1.5)
-
-        btn = (
-            page.ele('css:button[aria-label="kaikki"]')
-            or page.ele('css:button[aria-label="all"]')
-            or page.ele('text:kaikki')
-            or page.ele('text:all')
-        )
-        if btn:
-            btn.click(by_js=True)  # type: ignore[call-arg]
-            time.sleep(5)
-
-        for el in page.eles(f'css:{config["link_selector"]}'):  # type: ignore[union-attr]
-            href = getattr(el, 'attr', lambda x: None)("href") if hasattr(el, 'attr') else getattr(el, 'link', None)
-            if href:
-                clean = str(href).split('#')[0].split('?')[0]
-                if clean not in seen_links and clean not in unique_results:
-                    unique_results.append(clean)
-
-        logger.info("Фінляндія: %d посилань", len(unique_results))
-    except Exception as e:
-        logger.error("Помилка Фінляндія: %s", e)
-
-    return unique_results
+# scrape_finland() (старий Selenium-варіант) видалено — Finland тепер використовує
+# scrape_finland_api() з finland.py (PRH YTJ v3 open data API, без браузера)
 
 
 def _format_excel(tmp_path: str) -> None:
@@ -646,103 +685,8 @@ def run_scraping(chat_id: int, keyword: str, max_count: int,
             )
             return
 
-        # --- Фінляндія (пагінація браузером + вкладки) ---
-        # France перенесено до SIMPLE_SCRAPERS (API pappers.ai, без браузера)
-        seen_names_session: Set[str] = set()
-        seen_links: Set[str] = set()
-
-        while len(collected_data) < max_count:
-            if not status_dict.get('is_running', True):
-                break
-
-            try:
-                valid_hrefs = scrape_finland(page, config, keyword, seen_links)  # type: ignore[arg-type]
-            except Exception as e:
-                if "NEED_PROXY_CHANGE" in str(e):
-                    logger.info("Зміна проксі...")
-                    page.quit()  # type: ignore[union-attr]
-                    page, relay = get_page(chat_id, status_dict, site_key)
-                    if page is None:
-                        break
-                    continue
-                break
-
-            if not valid_hrefs:
-                break
-
-            for link in valid_hrefs:
-                if len(collected_data) >= max_count:
-                    break
-                if not status_dict.get('is_running', True):
-                    break
-                if link in seen_links:
-                    continue
-                seen_links.add(link)
-
-                if database.is_company_scraped(link):
-                    continue
-
-                company_tab = None
-                try:
-                    company_tab = page.new_tab(link)  # type: ignore[union-attr]
-                    check_and_wait_for_captcha(company_tab)
-
-                    name_ele = None
-                    for _ in range(10):
-                        name_ele = company_tab.ele(f'tag:{config["name_tag"]}')
-                        if name_ele:
-                            break
-                        time.sleep(1)
-
-                    if not name_ele:
-                        company_tab.close()
-                        continue
-
-                    raw_text = getattr(name_ele, 'text', '')
-                    if callable(raw_text):
-                        raw_text = raw_text()
-                    name = str(raw_text).strip().split('\n')[0]
-
-                    if not name:
-                        company_tab.close()
-                        continue
-
-                    name_lower = name.lower()
-                    if name_lower in seen_names_session or database.is_company_name_scraped(name):
-                        company_tab.close()
-                        continue
-                    seen_names_session.add(name_lower)
-
-                    item = {"Назва": name, "Посилання": link}
-                    _persist_result(item, site_key, collected_data)
-                    status_dict['current'] = len(collected_data)
-                    status_dict['last_name'] = name
-                    logger.info("%d. %s", len(collected_data), name)
-                    company_tab.close()
-
-                except Exception as e:
-                    if company_tab:
-                        try:
-                            company_tab.close()
-                        except Exception:
-                            pass
-                    if "NEED_PROXY_CHANGE" in str(e):
-                        page.quit()  # type: ignore[union-attr]
-                        page, relay = get_page(chat_id, status_dict, site_key)
-                        if page is None:
-                            break
-                        break
-                    elif "disconnected" in str(e).lower():
-                        status_dict['is_running'] = False
-                        break
-                    else:
-                        logger.error("Помилка компанії %s: %s", link, e)
-
-            # Finland повертає всі результати за один запит — виходимо після першого pass
-            break
-
-        if collected_data:
-            save_scraping_results(chat_id, collected_data, file_format, status_dict)
+        # Якщо site_key не входить до SIMPLE_SCRAPERS — невідомий скрапер
+        logger.error("run_scraping: невідомий site_key '%s'", site_key)
 
     finally:
         status_dict['is_running'] = False
