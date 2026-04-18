@@ -843,21 +843,43 @@ def _find_expiry_in_text(text: str) -> Optional[tuple[str, bool]]:
             _diag(f"      [P0] future near DOB/ISS → {r}")
             return r
 
-    # Рядки де є дата до 2000 (однозначно DOB навіть без keyword)
-    lines_with_old_dates = {li for _, li in all_dates
-                            if any(d < "2000-01-01" for d, l in all_dates if l == li)}
+    # Рядки де ВСІ дати старі (<2000) → однозначно DOB-рядок без EXP.
+    # ВАЖЛИВО: якщо на рядку є і стара (DOB 1985), і свіжа (EXP 2026) дати —
+    # НЕ викидаємо весь рядок, бо тоді втратимо валідну EXP. Свіжа дата
+    # буде використана як кандидат, стару відсіє фільтр d > today_iso / d >= "2010".
+    from collections import defaultdict as _dd
+    _line_dates: dict[int, list[str]] = _dd(list)
+    for d, li in all_dates:
+        _line_dates[li].append(d)
+    lines_with_old_dates = {
+        li for li, dlist in _line_dates.items()
+        if dlist and all(d < "2000-01-01" for d in dlist)
+    }
+    # Рядки з мішаним складом (є і <2000, і >=2010) — лог для діагностики
+    mixed_old_recent = {
+        li for li, dlist in _line_dates.items()
+        if any(d < "2000-01-01" for d in dlist) and any(d >= "2010-01-01" for d in dlist)
+    }
+    if mixed_old_recent:
+        _diag(f"      [skip] mixed old+recent lines (NOT skipped): {sorted(mixed_old_recent)}")
     # Додаємо skipped рядки з пріоритету 0 та їх сусідів (±1)
     skip_all = set(lines_with_old_dates)
     for sl in skipped_lines:
         skip_all.update({sl - 1, sl, sl + 1})
 
     # Пріоритет 1a: МАЙБУТНІ дати поруч із expiry-keywords (±2 рядки), НЕ DOB/ISS
+    # Виняток: якщо дата майбутня І на її рядку є також стара дата (DOB+EXP на
+    # одному рядку) — не блокуємо її через _is_near_dob, бо на такому рядку
+    # «DOB» якір стосується саме старої дати, а не свіжої.
+    def _date_on_mixed_line(line_idx: int) -> bool:
+        return line_idx in mixed_old_recent
+
     candidates_future = [
         d for d, li in all_dates
         if d > today_iso
         and any(abs(li - el) <= 2 for el in expiry_lines)
-        and not _is_near_dob(li)
-        and not _is_near_issue(li)
+        and (not _is_near_dob(li) or _date_on_mixed_line(li))
+        and (not _is_near_issue(li) or _date_on_mixed_line(li))
         and li not in skip_all
     ]
     if candidates_future:
@@ -1144,6 +1166,21 @@ def _vote_dates(dates: list[tuple[str, str]]) -> Optional[str]:
         closest = min(dates, key=lambda x: abs((_dt_date.fromisoformat(x[0]) - today).days))
         _diag(f"    [Vote] no consensus (same M-D, diff year): {dates}, closest → {closest[0]}")
         return closest[0]
+
+    # Немає консенсусу, різні дати — перевіряємо майбутні vs минулі
+    # (EXP завжди майбутня; якщо один движок витягнув минулу дату — це ймовірно
+    # ISS/DOB, тоді пріоритет майбутній)
+    future_dates = [(d, s) for d, s in dates
+                    if _dt_date.fromisoformat(d) >= today]
+    past_dates = [(d, s) for d, s in dates
+                  if _dt_date.fromisoformat(d) < today]
+    if future_dates and past_dates:
+        # Є і майбутні, і минулі — обираємо найближчу майбутню (реалістичний EXP)
+        best_future = min(future_dates,
+                          key=lambda x: (_dt_date.fromisoformat(x[0]) - today).days)
+        _diag(f"    [Vote] no consensus (future vs past): {dates}, "
+              f"using future → {best_future[0]}")
+        return best_future[0]
 
     # Різні дати — бере першу (Tesseract як більш надійний)
     _diag(f"    [Vote] no consensus: {dates}, using first")
@@ -1453,10 +1490,16 @@ def local_analyze(image_bytes: bytes, client_id: str = "") -> dict:
     # Збираємо результати з орієнтацій, з EARLY EXIT
     candidates: list[tuple[str, str]] = []   # (exp_date, source)
 
+    # PIL rotate — counter-clockwise. Покриваємо всі 4 орієнтації:
+    #   0°    — оригінал (правильна орієнтація)
+    #   180°  — перевернуте вгору ногами
+    #   270°  — документ знятий «наліво» (треба повернути CCW 270°, еквівалент 90° CW)
+    #   90°   — документ знятий «направо» (треба повернути CCW 90°, еквівалент 270° CW)
     orientations = [
         (img,                               "Local OCR"),
         (img.rotate(180, expand=False),     "Local OCR (180°)"),
-        (img.rotate(270, expand=True),      "Local OCR (90°)"),
+        (img.rotate(270, expand=True),      "Local OCR (90° CW)"),
+        (img.rotate(90,  expand=True),      "Local OCR (270° CW)"),
     ]
 
     for rotated_img, source_label in orientations:

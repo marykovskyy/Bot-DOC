@@ -103,7 +103,12 @@ s3_client = boto3.client(
     aws_secret_access_key=_AWS_SECRET,
 )
 
-openai_client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+_OPENAI_KEY = os.getenv("OPENAI_API_KEY") or ""
+# OpenAI ввімкнений тільки якщо є валідний ключ (не placeholder/не пустий)
+OPENAI_ENABLED = bool(_OPENAI_KEY) and not _OPENAI_KEY.lower().startswith(("your_", "sk-your", "placeholder"))
+openai_client = AsyncOpenAI(api_key=_OPENAI_KEY) if OPENAI_ENABLED else None
+if not OPENAI_ENABLED:
+    logger.info("OpenAI Vision DISABLED (ключ відсутній або placeholder)")
 
 # Один семафор на рівні КЛІЄНТА — природньо обмежує і Textract, і OpenAI
 # (OpenAI — fallback всередині клієнта, тому окремий semaphore не потрібен)
@@ -359,6 +364,10 @@ async def _openai_vision_analyze(image_bytes: bytes, client_id: str = "") -> dic
     """GPT-4o Vision як резерв коли Textract не впорався.Повертає dict з exp_date та doc_type."""
     result = {"exp_date": None, "doc_type": None}
 
+    # Якщо OpenAI вимкнений (немає ключа / placeholder) — одразу повертаємо порожній результат
+    if not OPENAI_ENABLED or openai_client is None:
+        return result
+
     b64 = base64.b64encode(image_bytes).decode('utf-8')
     prompt = (
         "Analyze this identity document image carefully.\n"
@@ -422,7 +431,11 @@ async def _analyze_single_image(image_bytes: bytes, client_id: str = "") -> dict
     from database import get_cache_entry, save_cache_entry
 
     # ── Крок 0: Кеш ──
-    img_hash = _hashlib.md5(image_bytes).hexdigest()
+    # CACHE_VERSION: збільшувати при змінах OCR-логіки (vote, parse, rotations тощо),
+    # щоб старі помилкові записи не «прилипли» і перераховувались заново.
+    # v2 (2026-04-18): Vote future-vs-past fix, skip-логіка по датах, 90° CW
+    CACHE_VERSION = b"v2"
+    img_hash = _hashlib.md5(image_bytes + CACHE_VERSION).hexdigest()
     cached = await asyncio.to_thread(get_cache_entry, img_hash)
     if cached:
         logger.debug("Кеш-хіт для %s", img_hash[:8])
@@ -536,6 +549,11 @@ async def _analyze_single_image(image_bytes: bytes, client_id: str = "") -> dict
         return result
 
     # ── Крок 3: OpenAI Vision (запасний — тільки якщо Textract не дав дату) ──
+    if not OPENAI_ENABLED:
+        # OpenAI вимкнений — пропускаємо, щоб не спамити лог
+        await asyncio.to_thread(save_cache_entry, img_hash, None, None, None, "NOT_FOUND")
+        return {"exp_date": None, "doc_type": None, "country": None, "source": "NOT_FOUND"}
+
     _diag_ai(client_id, "Textract → no date, trying OpenAI Vision")
     logger.debug("Textract не знайшов дату — пробуємо OpenAI Vision")
     vision_result = await _openai_vision_analyze(compressed, client_id=client_id)
