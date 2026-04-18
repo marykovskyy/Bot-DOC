@@ -37,7 +37,7 @@ def get_all_document_links(company_number: str) -> dict[str, str]:
     docs: dict[str, str] = {}
     url = f"https://api.company-information.service.gov.uk/company/{company_number}/filing-history"
     try:
-        res = requests.get(url, params={"items_per_page": 100}, auth=(str(UK_API_KEY), ''))
+        res = requests.get(url, params={"items_per_page": 100}, auth=(str(UK_API_KEY), ''), timeout=30)
         if res.status_code != 200:
             return docs
         for item in res.json().get('items', []):
@@ -88,7 +88,8 @@ def scrape_uk_api(keyword: str, max_count: int, status_dict: dict) -> list[dict]
         response = requests.get(
             "https://api.company-information.service.gov.uk/search/companies",
             params={"q": keyword, "items_per_page": 100},
-            auth=(str(UK_API_KEY), '')
+            auth=(str(UK_API_KEY), ''),
+            timeout=30,
         )
         if response.status_code != 200:
             logger.error("UK API відповів %d", response.status_code)

@@ -33,7 +33,7 @@ def scrape_latvia(keyword: str, max_count: int, status_dict: dict) -> list[dict]
         }
 
         try:
-            response = requests.get(_API_URL, params=params, headers=headers)
+            response = requests.get(_API_URL, params=params, headers=headers, timeout=30)
             if response.status_code != 200:
                 logger.error("API Латвії відповів %d", response.status_code)
                 break

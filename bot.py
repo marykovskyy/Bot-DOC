@@ -212,19 +212,62 @@ def main() -> None:
 
     # ── Ініціалізація при старті ──
     async def post_init(application) -> None:  # type: ignore[type-arg]
-        await start_health_server(port=8080)
-        database.init_db()
-        _load_scheduled_tasks()
-        _scheduler.start()
-        logger.info("Scheduler запущено.")
-        await run_auto_cleanup()
-        logger.info("Auto-cleanup завершено.")
-        load_all_templates()  # Завантажуємо шаблони документів з templates/
+        # Глобальний exception handler для fire-and-forget asyncio.create_task(...) —
+        # без нього помилки в не-awaited тасках лише варнингуються при GC і губляться.
+        # З ним — логи + Sentry бачать кожен unhandled exception.
+        import asyncio
+
+        def _loop_exception_handler(loop, context):
+            exc = context.get("exception")
+            msg = context.get("message", "unknown asyncio error")
+            if exc:
+                logger.error("asyncio task exception: %s", msg, exc_info=exc)
+                # Sentry підхопить автоматично через logging integration
+            else:
+                logger.error("asyncio loop error: %s | context=%s", msg, context)
+
+        try:
+            asyncio.get_running_loop().set_exception_handler(_loop_exception_handler)
+        except Exception:
+            logger.exception("Не вдалось встановити asyncio exception handler.")
+
+        # Кожен крок обгорнуто окремо: критичні кроки (init_db) переривають старт,
+        # допоміжні (templates, warmup) — лише логуються, бот все одно піднімається.
+        try:
+            await start_health_server(port=8080)
+        except Exception:
+            logger.exception("post_init: health-server не стартував (non-fatal).")
+
+        try:
+            database.init_db()
+        except Exception:
+            logger.exception("post_init: init_db ЗАФЕЙЛИВ — критично, зупиняю старт.")
+            raise
+
+        try:
+            _load_scheduled_tasks()
+            _scheduler.start()
+            logger.info("Scheduler запущено.")
+        except Exception:
+            logger.exception("post_init: scheduler не стартував (non-fatal, бот працюватиме без cron).")
+
+        try:
+            await run_auto_cleanup()
+            logger.info("Auto-cleanup завершено.")
+        except Exception:
+            logger.exception("post_init: auto-cleanup впав (non-fatal).")
+
+        try:
+            load_all_templates()
+        except Exception:
+            logger.exception("post_init: load_all_templates впав (non-fatal, документи можуть не працювати).")
 
         # Прогрів PaddleOCR — завантажує моделі заздалегідь (~10с)
-        import asyncio
-        from analysis.doc_analyzer import warmup_paddle_ocr
-        await asyncio.to_thread(warmup_paddle_ocr)
+        try:
+            from analysis.doc_analyzer import warmup_paddle_ocr
+            await asyncio.to_thread(warmup_paddle_ocr)
+        except Exception:
+            logger.exception("post_init: PaddleOCR warmup впав (non-fatal, моделі завантажаться при першому використанні).")
 
     app.post_init = post_init  # type: ignore[method-assign]
     logger.info("🤖 Бот запущений!")
