@@ -538,6 +538,27 @@ async def repeat_from_history(update: Update, context: ContextTypes.DEFAULT_TYPE
     # Заповнюємо user_data і запускаємо
     if context.user_data is None:
         return
+    # Для UK: режим PDF/links не зберігається в історії, тому спершу питаємо.
+    # Раніше хардкодно було False — юзер що хотів PDF їх не отримував.
+    if item["site"] == "UnitedKingdom":
+        import uuid as _uuid
+        token = _uuid.uuid4().hex[:10]
+        pending = context.bot_data.setdefault("pending_repeat", {})
+        pending[token] = {"history_id": history_id, "chat_id": chat_id}
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("📥 Завантажити PDF", callback_data=f"rpt_uk_pdf_{token}"),
+            InlineKeyboardButton("🔗 Тільки посилання", callback_data=f"rpt_uk_lnk_{token}"),
+        ]])
+        try:
+            await query.edit_message_text(
+                f"🇬🇧 Повторюємо пошук UK: <code>{item['keyword']}</code>\n\n"
+                f"Обери режим завантаження:",
+                parse_mode="HTML",
+                reply_markup=kb,
+            )
+        except Exception:
+            pass
+        return
     context.user_data.update({
         "site": item["site"],
         "kw": item["keyword"],
@@ -570,6 +591,92 @@ async def repeat_from_history(update: Update, context: ContextTypes.DEFAULT_TYPE
         args=(chat_id, item["keyword"], item["count"],
               item["site"], item["file_format"], scraping_status[chat_id]),
         daemon=True
+    ).start()
+
+    asyncio.create_task(status_updater(context, chat_id, msg.message_id))
+
+
+async def repeat_uk_mode_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обробляє вибір режиму PDF/links при повторі UK пошуку з історії."""
+    import asyncio
+    import threading
+    from scrapers.main import run_scraping
+    from state import scraping_status, _status_lock, MAX_PARALLEL_TASKS
+    from keyboards import get_stop_kb
+    from handlers.scraping import status_updater, safe_answer
+    import time as _time
+
+    query = update.callback_query
+    if not query or not query.data or not update.effective_user:
+        return
+    await safe_answer(query)
+
+    data = query.data  # rpt_uk_pdf_<token> або rpt_uk_lnk_<token>
+    download_pdf = data.startswith("rpt_uk_pdf_")
+    token = data.rsplit("_", 1)[-1]
+    pending = context.bot_data.get("pending_repeat", {})
+    info = pending.pop(token, None)
+    if not info:
+        try:
+            await query.edit_message_text("⌛ Сесія вибору прострочена. Натисни «Повторити» знову.")
+        except Exception:
+            pass
+        return
+
+    history_id = info["history_id"]
+    chat_id = info["chat_id"]
+    history = database.get_search_history(chat_id, limit=50)
+    item = next((h for h in history if h["id"] == history_id), None)
+    if not item:
+        try:
+            await query.edit_message_text("❌ Запис з історії зник.")
+        except Exception:
+            pass
+        return
+
+    if context.user_data is None:
+        return
+    context.user_data.update({
+        "site": item["site"],
+        "kw": item["keyword"],
+        "count": str(item["count"]),
+        "target_year": item["year"],
+        "uk_download_pdf": download_pdf,
+    })
+
+    async with _status_lock:
+        active_tasks = sum(1 for s in scraping_status.values() if s.get("is_running"))
+        if active_tasks >= MAX_PARALLEL_TASKS:
+            try:
+                await query.edit_message_text("⏳ Черга заповнена, спробуй пізніше.")
+            except Exception:
+                pass
+            return
+        scraping_status[chat_id] = {
+            "current": 0, "max": item["count"],
+            "last_name": "Повтор пошуку...", "is_running": True,
+            "file_path": None, "target_year": item["year"],
+            "uk_download_pdf": download_pdf, "site": item["site"],
+            "started_at": _time.time(),
+        }
+
+    mode_label = "📥 PDF" if download_pdf else "🔗 Посилання"
+    msg = await context.bot.send_message(
+        chat_id=chat_id,
+        text=f"🔄 Повторюю UK пошук ({mode_label}): <code>{item['keyword']}</code>",
+        parse_mode="HTML",
+        reply_markup=get_stop_kb(),
+    )
+    try:
+        await query.delete_message()
+    except Exception:
+        pass
+
+    threading.Thread(
+        target=run_scraping,
+        args=(chat_id, item["keyword"], item["count"],
+              item["site"], item["file_format"], scraping_status[chat_id]),
+        daemon=True,
     ).start()
 
     asyncio.create_task(status_updater(context, chat_id, msg.message_id))

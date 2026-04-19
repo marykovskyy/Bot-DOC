@@ -1,4 +1,5 @@
 import asyncio
+import html as _html
 import logging
 import os
 import threading
@@ -49,11 +50,11 @@ async def safe_answer(query, text: str | None = None, show_alert: bool = False) 
             logger.debug("safe_answer: %s", e)
 
 
-async def safe_edit(query, text: str, reply_markup=None) -> None:
+async def safe_edit(query, text: str, reply_markup=None, parse_mode: str = 'Markdown') -> None:
     from telegram.error import BadRequest
     if query:
         try:
-            await query.edit_message_text(text=text, reply_markup=reply_markup, parse_mode='Markdown')
+            await query.edit_message_text(text=text, reply_markup=reply_markup, parse_mode=parse_mode)
         except BadRequest:
             pass
 
@@ -91,29 +92,35 @@ async def save_kw(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── Валідація: довжина ─────────────────────────────────────────
     if not raw_kw:
-        await update.message.reply_text("❌ Ключове слово не може бути порожнім.")
+        await update.message.reply_text(
+            "❌ Ключове слово не може бути порожнім. Введи назву/галузь або натисни «Назад».",
+            reply_markup=get_back_kb("start"),
+        )
         return TYPING_KEYWORD
     if len(raw_kw) > _MAX_KEYWORD_LEN:
         await update.message.reply_text(
-            f"❌ Ключ занадто довгий: {len(raw_kw)} символів. Максимум: {_MAX_KEYWORD_LEN}."
+            f"❌ Ключ занадто довгий: {len(raw_kw)} символів. Максимум: {_MAX_KEYWORD_LEN}.",
+            reply_markup=get_back_kb("start"),
         )
         return TYPING_KEYWORD
 
     context.user_data['kw'] = raw_kw
 
-    # Підтримка кількох ключових слів через кому
+    # Підтримка кількох ключових слів через кому.
+    # ВАЖЛИВО: parse_mode=HTML + html.escape, бо юзерський ввід може містити
+    # `_` `*` backtick які ламають Markdown рендер (BadRequest → тиша).
     keywords = [k.strip() for k in raw_kw.split(',') if k.strip()]
     if len(keywords) > 1:
-        kw_preview = '\n'.join(f"  • `{k}`" for k in keywords)
-        header = f"🔑 Ключових слів: **{len(keywords)}**\n{kw_preview}"
+        kw_preview = '\n'.join(f"  • <code>{_html.escape(k)}</code>" for k in keywords)
+        header = f"🔑 Ключових слів: <b>{len(keywords)}</b>\n{kw_preview}"
         note = "\n\n💡 Бот пройдеться по кожному слову і об'єднає результати."
     else:
-        header = f"🔑 Ключ: `{raw_kw}`"
+        header = f"🔑 Ключ: <code>{_html.escape(raw_kw)}</code>"
         note = ""
 
     await update.message.reply_text(
-        f"{header}{note}\n\n🔢 **Скільки компаній зібрати** (загалом)?",
-        reply_markup=get_back_kb("kw"), parse_mode="Markdown"
+        f"{header}{note}\n\n🔢 <b>Скільки компаній зібрати</b> (загалом)?",
+        reply_markup=get_back_kb("kw"), parse_mode="HTML"
     )
     return TYPING_COUNT
 
@@ -122,16 +129,23 @@ async def save_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text or context.user_data is None:
         return TYPING_COUNT
     if not update.message.text.isdigit():
-        await update.message.reply_text("❌ Будь ласка, введіть число (наприклад: 50).")
+        await update.message.reply_text(
+            "❌ Будь ласка, введіть число (наприклад: 50).",
+            reply_markup=get_back_kb("kw"),
+        )
         return TYPING_COUNT
     try:
         count_val = int(update.message.text)
     except ValueError:
-        await update.message.reply_text("❌ Невірний формат числа.")
+        await update.message.reply_text(
+            "❌ Невірний формат числа. Приклад: 50",
+            reply_markup=get_back_kb("kw"),
+        )
         return TYPING_COUNT
     if not (1 <= count_val <= _MAX_COUNT):
         await update.message.reply_text(
-            f"❌ Кількість має бути від 1 до {_MAX_COUNT}. Ви ввели: {count_val}."
+            f"❌ Кількість має бути від 1 до {_MAX_COUNT}. Ви ввели: {count_val}.",
+            reply_markup=get_back_kb("kw"),
         )
         return TYPING_COUNT
     context.user_data['count'] = str(count_val)
@@ -139,7 +153,7 @@ async def save_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📅 **Починаючи з якого року реєстрації шукати компанії?**\n\n"
         "Введіть рік (наприклад: `2022`) — бот знайде компанії за **2022, 2023, 2024...** і далі.\n"
         "Або введіть `0` — без обмежень по даті.",
-        parse_mode="Markdown"
+        reply_markup=get_back_kb("count"), parse_mode="Markdown"
     )
     return TYPING_YEAR
 
@@ -154,7 +168,7 @@ async def save_year(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if raw != "0" and (not raw.isdigit() or len(raw) != 4):
         await update.message.reply_text(
             "❌ Введіть 4-значний рік (наприклад: `2022`) або `0` для всіх дат.",
-            parse_mode="Markdown"
+            reply_markup=get_back_kb("count"), parse_mode="Markdown"
         )
         return TYPING_YEAR
 
@@ -163,7 +177,8 @@ async def save_year(update: Update, context: ContextTypes.DEFAULT_TYPE):
         year_val = int(raw)
         if not (_MIN_YEAR <= year_val <= _MAX_YEAR):
             await update.message.reply_text(
-                f"❌ Рік має бути в діапазоні {_MIN_YEAR}–{_MAX_YEAR}. Ви ввели: {year_val}."
+                f"❌ Рік має бути в діапазоні {_MIN_YEAR}–{_MAX_YEAR}. Ви ввели: {year_val}.",
+                reply_markup=get_back_kb("count"),
             )
             return TYPING_YEAR
 
@@ -204,18 +219,27 @@ async def handle_navigation(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_edit(query, "❌ **Пошук скасовано.**")
         return ConversationHandler.END
 
+    # HTML escape — kw/site можуть містити спецсимволи. Markdown тут ламався.
+    _site_esc = _html.escape(str(context.user_data.get('site', '...')))
+    _kw_esc = _html.escape(str(context.user_data.get('kw', '')))
+    _year_esc = _html.escape(str(context.user_data.get('target_year', '')))
+    _count_esc = _html.escape(str(context.user_data.get('count', '')))
     nav_map = {
-        "back_start": (SELECT_SITE, "🌍 **Оберіть сайт для пошуку:**", get_sites_kb()),
+        "back_start": (SELECT_SITE, "🌍 <b>Оберіть сайт для пошуку:</b>", get_sites_kb()),
         "back_kw": (TYPING_KEYWORD,
-                    f"🔎 **Введіть ключове слово** для `{context.user_data.get('site', '...')}`:",
+                    f"🔎 <b>Введіть ключове слово</b> для <code>{_site_esc}</code>:",
                     get_back_kb("start")),
         "back_count": (TYPING_COUNT,
-                       f"🔢 **Скільки компаній зібрати?** (ключ: `{context.user_data.get('kw', '')}`)",
+                       f"🔢 <b>Скільки компаній зібрати?</b> (ключ: <code>{_kw_esc}</code>)",
                        get_back_kb("kw")),
+        "back_year": (TYPING_YEAR,
+                      f"📅 <b>Рік реєстрації</b> (ключ: <code>{_kw_esc}</code>, "
+                      f"к-ть: <code>{_count_esc}</code>). Введіть 4-значний рік або <code>0</code>.",
+                      get_back_kb("count")),
     }
     if query.data in nav_map:
         state, text, kb = nav_map[query.data]
-        await safe_edit(query, text, kb)
+        await safe_edit(query, text, kb, parse_mode="HTML")
         return state
 
     return ConversationHandler.END
@@ -225,12 +249,23 @@ async def stop_scraping(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if not query or not update.effective_chat:
         return
-    await safe_answer(query)
+    # Миттєвий popup у юзера (замість тиші до наступного status_updater циклу)
+    await safe_answer(query, text="🛑 Зупиняю...", show_alert=False)
     chat_id = update.effective_chat.id
     async with _status_lock:
         if chat_id in scraping_status:
             scraping_status[chat_id]['is_running'] = False
-    await safe_edit(query, "🛑 **Зупинка процесу...**")
+            current = scraping_status[chat_id].get('current', 0)
+        else:
+            current = 0
+    # Пояснюємо юзеру що зупинка асинхронна — він не думає що бот завис
+    await safe_edit(
+        query,
+        f"🛑 <b>Зупинка процесу...</b>\n\n"
+        f"⏳ Закриваю браузер та зберігаю зібрані результати "
+        f"(<code>{current}</code> компаній). Це займе до {STATUS_UPDATE_SEC + 5} сек.",
+        parse_mode="HTML",
+    )
     return ConversationHandler.END
 
 
@@ -273,6 +308,7 @@ async def run_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── Атомарна перевірка + запис статусу (один лок!) ──
     # Два окремих блоки `async with _status_lock` створюють вікно для race condition:
     # між першим і другим блоком інший запит міг зайняти слот.
+    import time as _time
     async with _status_lock:
         active_tasks = sum(1 for s in scraping_status.values() if s.get('is_running'))
         if active_tasks >= MAX_PARALLEL_TASKS:
@@ -294,6 +330,8 @@ async def run_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
             'uk_download_pdf':   ud.get('uk_download_pdf', True),
             'filtered_inactive': 0,   # лічильник відфільтрованих неактивних
             'filtered_duplicate': 0,  # лічильник пропущених дублікатів
+            'started_at':        _time.time(),  # для ETA в status_updater
+            'site':              ud.get('site', ''),
         }
 
     msg_id = query.message.message_id if query.message else 0
@@ -339,6 +377,7 @@ async def status_updater(context: ContextTypes.DEFAULT_TYPE, chat_id: int, messa
     stop_kb   = InlineKeyboardMarkup([[InlineKeyboardButton("🛑 Зупинити збір", callback_data="stop_scraping")]])
     repeat_kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Почати новий пошук", callback_data="repeat_search")]])
 
+    import time as _time
     while True:
         # ── Короткий snapshot під локом ──
         async with _status_lock:
@@ -347,14 +386,35 @@ async def status_updater(context: ContextTypes.DEFAULT_TYPE, chat_id: int, messa
             current    = st.get('current', 0)        if st else 0
             total      = st.get('max', 1)             if st else 1
             last_name  = st.get('last_name', '...')  if st else '...'
+            started_at = st.get('started_at', 0)     if st else 0
 
         if not st or not is_running:
             break
 
         if current != last_count:
             p_bar = get_progress_bar(current, total)
+            # ── ETA і швидкість (якщо прогрес > 0) ──
+            eta_line = ""
+            if current > 0 and started_at > 0:
+                elapsed = max(_time.time() - started_at, 0.1)
+                speed = current / elapsed  # comp/sec
+                remaining = max(total - current, 0)
+                if speed > 0:
+                    eta_sec = int(remaining / speed)
+                    eta_h, rem = divmod(eta_sec, 3600)
+                    eta_m, eta_s = divmod(rem, 60)
+                    if eta_h:
+                        eta_str = f"{eta_h}г {eta_m}хв"
+                    elif eta_m:
+                        eta_str = f"{eta_m}хв {eta_s}с"
+                    else:
+                        eta_str = f"{eta_s}с"
+                    # швидкість: /хв якщо повільно, /с якщо швидко
+                    speed_str = f"{speed*60:.0f}/хв" if speed < 2 else f"{speed:.1f}/с"
+                    eta_line = f"⏱ ETA: ~{eta_str}  ·  ⚡ {speed_str}\n"
             text  = (
-                f"🚀 **Процес збору даних...**\n{p_bar}\n\n"
+                f"🚀 **Процес збору даних...**\n{p_bar}\n"
+                f"{eta_line}\n"
                 f"🏢 Опрацьовується:\n`{last_name}`\n\n"
                 f"✅ Зібрано: **{current}** з **{total}**"
             )

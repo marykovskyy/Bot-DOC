@@ -90,6 +90,17 @@ async def show_bot_status(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     # site — значення з scraping_status (control data, не user input), але все ж
     # використовуємо HTML як безпечніший parse_mode для будь-яких спецсимволів.
     import html as _html
+
+    # ── Обʼєднана картина: статус бота + глобальна статистика ──
+    # Раніше були дві окремі кнопки (📊 Статистика + 📊 Статус бота) з однаковою
+    # іконкою, юзери плутались. Тепер одна кнопка показує все.
+    try:
+        import database
+        from constants import COUNTRY_FLAGS
+        db_stats = database.get_global_stats()
+    except Exception:
+        db_stats = None
+
     html_text = (
         f"🖥 <b>Статус бота</b>\n\n"
         f"⏱ Uptime: <code>{hours:02d}:{minutes:02d}:{seconds:02d}</code>\n"
@@ -100,7 +111,19 @@ async def show_bot_status(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         for site, current, total in tasks_snapshot:
             html_text += f"  • <code>{_html.escape(str(site))}</code> — {current}/{total}\n"
     else:
-        html_text += "<i>Активних пошуків немає</i>"
+        html_text += "<i>Активних пошуків немає</i>\n"
+
+    if db_stats:
+        html_text += (
+            f"\n📊 <b>Зібрано всього:</b> <code>{db_stats['total']}</code> компаній "
+            f"(за сьогодні: <code>{db_stats['today']}</code>)\n"
+        )
+        if db_stats.get('by_country'):
+            top = db_stats['by_country'][:5]
+            html_text += "<b>Топ країн:</b>  "
+            html_text += "  ".join(
+                f"{COUNTRY_FLAGS.get(c, '📍')} <code>{cnt}</code>" for c, cnt in top
+            )
     await update.message.reply_text(html_text, parse_mode="HTML")
 
 
@@ -112,18 +135,35 @@ async def restart_bot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     """Перезапускає процес бота. Доступно тільки адміністратору.
 
     Graceful shutdown:
-      1. Повідомляємо користувача
-      2. Зупиняємо планувальник (уникнути паралельної задачі перед exec)
-      3. Flush логів
-      4. os.execl — замінює процес
+      1. Підтвердження (щоб випадковий /restart не вбивав активні скрапінги)
+      2. Повідомляємо користувача
+      3. Зупиняємо планувальник (уникнути паралельної задачі перед exec)
+      4. Flush логів
+      5. os.execl — замінює процес
     """
     if not is_admin(update):
         if update.message:
             await update.message.reply_text("⛔️ У вас немає прав для цієї команди.")
         return
 
-    if update.message:
-        await update.message.reply_text("🔄 Бот перезапускається...")
+    if not update.message:
+        return
+
+    # ── Confirm, якщо є активні скрапінги (захист від випадкового тапу) ──
+    args = (context.args or []) if context else []
+    force = bool(args) and args[0].lower() in ("confirm", "yes", "force")
+    async with _status_lock:
+        active_count = sum(1 for s in scraping_status.values() if s.get('is_running'))
+    if active_count > 0 and not force:
+        await update.message.reply_text(
+            f"⚠️ <b>Зараз виконується {active_count} активних скрапінгів.</b>\n\n"
+            f"Рестарт перерве їх і зібрані дані можуть загубитись.\n"
+            f"Якщо точно треба — напиши <code>/restart confirm</code>.",
+            parse_mode="HTML",
+        )
+        return
+
+    await update.message.reply_text("🔄 Бот перезапускається...")
 
     async def _restart():
         await asyncio.sleep(1)

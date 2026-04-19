@@ -28,7 +28,7 @@ from state import _scheduler
 from analysis.ai_sorter import (
     handle_zip_documents, handle_gdrive_link, cmd_myresults,
     handle_delivery_callback, cancel_analysis_callback, cmd_analysis_logs,
-    cmd_cleanup, run_auto_cleanup,
+    cmd_cleanup, run_auto_cleanup, confirm_analysis_callback,
 )
 
 # ── Handlers ──
@@ -45,7 +45,7 @@ from handlers.admin import (
     is_admin, require_auth,
     show_stats, show_help, help_section_callback,
     cmd_users, cmd_adduser, cmd_removeuser, cmd_unblockuser,
-    cmd_history, repeat_from_history,
+    cmd_history, repeat_from_history, repeat_uk_mode_callback,
 )
 from handlers.schedule import (
     cmd_schedule, handle_schedule_callback,
@@ -145,10 +145,19 @@ def main() -> None:
         cancel_analysis_callback,
         pattern=r"^cancel_analysis_\d+$"
     ))
+    # Preview-confirm для ZIP/GDrive аналізу — юзер бачить вартість і структуру
+    # перед запуском OCR+GPT-4o (реальні $). Без цього гроші горіли без згоди.
+    app.add_handler(CallbackQueryHandler(
+        confirm_analysis_callback,
+        pattern=r"^(confirm_analysis_|cancelconfirm_)[0-9a-f]{10}$"
+    ))
 
     # ── Скрапінг / зупинка ──
     app.add_handler(CallbackQueryHandler(stop_scraping, pattern="^stop_scraping$"))
     app.add_handler(CallbackQueryHandler(repeat_from_history, pattern="^repeat_\\d+$"))
+    app.add_handler(CallbackQueryHandler(
+        repeat_uk_mode_callback, pattern=r"^rpt_uk_(pdf|lnk)_[0-9a-f]{10}$"
+    ))
 
     # ── Допомога (навігація між секціями) ──
     app.add_handler(CallbackQueryHandler(help_section_callback, pattern="^(help_|noop)"))

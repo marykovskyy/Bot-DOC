@@ -1,5 +1,6 @@
 import os
 import shutil
+import time
 import zipfile
 import tempfile
 import asyncio
@@ -186,6 +187,88 @@ def _ensure_queue_worker() -> None:
         _queue_generation += 1
         _queue_task = asyncio.create_task(_queue_worker(_queue_generation))
         logger.debug("Queue worker started, generation=%d", _queue_generation)
+
+
+def _scan_zip_contents(zip_path: str) -> tuple[int, int]:
+    """Швидко сканує ZIP і повертає (clients, images) для прев'ю перед аналізом.
+    Клієнт = top-level папка, image = файл з розширенням jpg/jpeg/png/webp/heic.
+    Нічого не розпаковує — читає тільки namelist.
+    """
+    import zipfile as _zf
+    clients: set[str] = set()
+    images = 0
+    _img_ext = {".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif"}
+    try:
+        with _zf.ZipFile(zip_path, "r") as z:
+            for name in z.namelist():
+                # top-level папка (до першого слеша)
+                parts = name.replace("\\", "/").split("/")
+                if len(parts) >= 2 and parts[0]:
+                    clients.add(parts[0])
+                ext = os.path.splitext(name)[1].lower()
+                if ext in _img_ext:
+                    images += 1
+    except Exception as e:
+        logger.warning("scan_zip: %s", e)
+    return len(clients), images
+
+
+async def _ask_confirm_analysis(update, context, zip_path: str, work_dir: str, status_msg) -> None:
+    """Показує preview ZIP (клієнти/фото/оцінка вартості) і чекає підтвердження.
+    Дані складаємо в context.bot_data[token], callback витягне і запустить _enqueue_analysis.
+    """
+    import uuid as _uuid
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+    clients_count, images_count = await asyncio.to_thread(_scan_zip_contents, zip_path)
+
+    # Орієнтовна вартість: AWS Textract ~$0.0015/стор, GPT-4o Vision ~$0.003/стор.
+    # Не всі фото підуть у OpenAI (fallback). Грубо: $0.002 × images.
+    est_cost_usd = images_count * 0.002
+
+    token = _uuid.uuid4().hex[:10]
+    pending = context.bot_data.setdefault("pending_analysis", {})
+    # TTL 1 година на випадок якщо юзер забув — _cleanup старих токенів нижче
+    pending[token] = {
+        "zip_path": zip_path,
+        "work_dir": work_dir,
+        "status_msg_chat_id": status_msg.chat_id,
+        "status_msg_id": status_msg.message_id,
+        "user_id": update.effective_user.id if update.effective_user else 0,
+        "created_at": time.time(),
+    }
+    # Чистимо протухлі (>1 год)
+    stale = [k for k, v in pending.items() if time.time() - v.get("created_at", 0) > 3600]
+    for k in stale:
+        old = pending.pop(k, {})
+        shutil.rmtree(old.get("work_dir", ""), ignore_errors=True)
+
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("▶️ Почати аналіз", callback_data=f"confirm_analysis_{token}"),
+        InlineKeyboardButton("❌ Скасувати",     callback_data=f"cancelconfirm_{token}"),
+    ]])
+
+    if images_count == 0:
+        await status_msg.edit_text(
+            "⚠️ В архіві не знайдено зображень (.jpg/.png/.webp/.heic).\n"
+            "Перевір структуру: <b>папка клієнта → фото всередині</b>.",
+            parse_mode="HTML",
+        )
+        # Видаляємо token — запускати нема що
+        pending.pop(token, None)
+        shutil.rmtree(work_dir, ignore_errors=True)
+        return
+
+    await status_msg.edit_text(
+        f"📦 <b>Архів готовий до аналізу</b>\n\n"
+        f"👥 Клієнтів (папок): <code>{clients_count}</code>\n"
+        f"🖼 Зображень: <code>{images_count}</code>\n"
+        f"💵 Орієнтовна вартість API: <b>~${est_cost_usd:.2f}</b>\n"
+        f"<i>(AWS Textract + GPT-4o Vision fallback)</i>\n\n"
+        f"Запустити аналіз?",
+        parse_mode="HTML",
+        reply_markup=kb,
+    )
 
 
 async def _enqueue_analysis(
@@ -1129,6 +1212,80 @@ async def cancel_analysis_callback(update: Update, context: ContextTypes.DEFAULT
 
 
 @require_auth
+async def confirm_analysis_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Натискання «▶️ Почати аналіз» / «❌ Скасувати» після preview ZIP.
+    Витягує token з callback_data, з context.bot_data[token] забирає
+    zip_path+work_dir+status_msg і запускає _enqueue_analysis (або чистить).
+    """
+    query = update.callback_query
+    if not query or not query.data:
+        return
+    try:
+        await query.answer()
+    except Exception:
+        pass
+
+    raw = query.data
+    pending = context.bot_data.get("pending_analysis", {})
+
+    if raw.startswith("cancelconfirm_"):
+        token = raw[len("cancelconfirm_"):]
+        data = pending.pop(token, None)
+        if data:
+            shutil.rmtree(data.get("work_dir", ""), ignore_errors=True)
+        try:
+            await query.edit_message_text(
+                "❌ Аналіз скасовано. Нічого не списано."
+            )
+        except Exception:
+            pass
+        return
+
+    if not raw.startswith("confirm_analysis_"):
+        return
+    token = raw[len("confirm_analysis_"):]
+    data = pending.pop(token, None)
+    if not data:
+        try:
+            await query.edit_message_text(
+                "⌛ Сесія підтвердження прострочена або вже запущена. "
+                "Надішли архів заново."
+            )
+        except Exception:
+            pass
+        return
+
+    # Перевірка що це той самий юзер що відкрив preview
+    if update.effective_user and data.get("user_id") and update.effective_user.id != data["user_id"]:
+        try:
+            await query.answer("Це не твій архів 😉", show_alert=True)
+        except Exception:
+            pass
+        return
+
+    zip_path = data["zip_path"]
+    work_dir = data["work_dir"]
+
+    # Відновлюємо «status_msg» інтерфейс через chat_id/message_id
+    class _MsgProxy:
+        def __init__(self, bot, chat_id, msg_id):
+            self._bot = bot
+            self.chat_id = chat_id
+            self.message_id = msg_id
+        async def edit_text(self, text, **kw):
+            try:
+                return await self._bot.edit_message_text(
+                    chat_id=self.chat_id, message_id=self.message_id, text=text, **kw
+                )
+            except Exception:
+                pass
+
+    status_msg = _MsgProxy(context.bot, data["status_msg_chat_id"], data["status_msg_id"])
+    await status_msg.edit_text("✅ Підтверджено. Ставлю в чергу аналізу...")
+    await _enqueue_analysis(update, context, zip_path, work_dir, status_msg)
+
+
+@require_auth
 async def cmd_analysis_logs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Команда /analysislogs — показує лог аналізів (тільки для адміна)."""
     if not update.message:
@@ -1489,10 +1646,11 @@ async def handle_gdrive_link(update: Update, context: ContextTypes.DEFAULT_TYPE)
         file_size_mb = os.path.getsize(zip_path) / 1024 / 1024
         await status_msg.edit_text(
             f"✅ Завантажено: {file_size_mb:.1f} МБ\n"
-            f"🔍 Запускаю AI аналіз..."
+            f"🔎 Аналізую структуру архіву..."
         )
 
-        await _enqueue_analysis(update, context, zip_path, work_dir, status_msg)
+        # Preview + confirm — юзер бачить вартість до запуску OCR
+        await _ask_confirm_analysis(update, context, zip_path, work_dir, status_msg)
 
     except Exception as e:
         logger.error("Помилка Google Drive: %s", e)
@@ -1911,7 +2069,8 @@ async def handle_zip_documents(update: Update, context: ContextTypes.DEFAULT_TYP
     try:
         file = await context.bot.get_file(doc.file_id)
         await file.download_to_drive(zip_path)
-        await _enqueue_analysis(update, context, zip_path, work_dir, status_msg)
+        # Preview + confirm замість прямого enqueue — юзер підтверджує вартість
+        await _ask_confirm_analysis(update, context, zip_path, work_dir, status_msg)
     except Exception as e:
         logger.error("Помилка завантаження з Telegram: %s", e)
         await status_msg.edit_text(f"❌ Помилка: {e}")
@@ -1977,9 +2136,11 @@ async def cmd_myresults(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 #  ОЧИЩЕННЯ СТАРИХ СЕСІЙ
 # ─────────────────────────────────────────────
 
-def _cleanup_old_sessions_sync(keep_days: int) -> tuple[int, int]:
+def _cleanup_old_sessions_sync(keep_days: int, dry_run: bool = False) -> tuple[int, int]:
     """Видаляє сесійні папки старіші keep_days днів з LOCAL_RESULTS_DIR.
     Повертає (видалено, помилок).
+
+    dry_run=True — НЕ видаляє, лише рахує скільки БУЛО б видалено.
     Виконується в окремому потоці (IO-bound).
     """
     _sess_pattern = re.compile(r"^(\d{2})\.(\d{2})\.(\d{4})\.(\d{2})\.(\d{2})")
@@ -2002,8 +2163,9 @@ def _cleanup_old_sessions_sync(keep_days: int) -> tuple[int, int]:
         try:
             mtime = os.path.getmtime(full_path)
             if mtime < cutoff:
-                shutil.rmtree(full_path)
-                logger.info("Cleanup: видалено стару сесію '%s'", name)
+                if not dry_run:
+                    shutil.rmtree(full_path)
+                    logger.info("Cleanup: видалено стару сесію '%s'", name)
                 removed += 1
         except Exception as e:
             logger.warning("Cleanup: помилка видалення '%s': %s", name, e)
@@ -2029,8 +2191,14 @@ async def cmd_cleanup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not update.message:
         return
 
-    # Парсимо аргумент: /cleanup 7 → видалити старіші 7 днів
+    # Парсимо аргументи: /cleanup [днів] [confirm]
+    # Без confirm — dry-run (показує скільки БУЛО б видалено, нічого не чіпає).
+    # З confirm — реально видаляє. Захист від випадкового тапу.
     args = (context.args or [])
+    force = False
+    if args and args[-1].lower() in ("confirm", "yes", "force"):
+        force = True
+        args = args[:-1]
     try:
         days = int(args[0]) if args else SESSION_KEEP_DAYS
         if days < 1:
@@ -2038,9 +2206,26 @@ async def cmd_cleanup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     except (ValueError, IndexError):
         await update.message.reply_text(
             f"⚠️ Невірний аргумент. Використання:\n"
-            f"`/cleanup [днів]` — наприклад `/cleanup 7`\n\n"
+            f"`/cleanup [днів]` — показати що БУДЕ видалено (preview)\n"
+            f"`/cleanup [днів] confirm` — реально видалити\n\n"
             f"За замовчуванням: {SESSION_KEEP_DAYS} днів",
             parse_mode="Markdown"
+        )
+        return
+
+    if not force:
+        # Dry-run — рахуємо скільки сесій підпадає, нічого не видаляємо
+        would_remove, errors = await asyncio.to_thread(_cleanup_old_sessions_sync, days, True)
+        if would_remove == 0:
+            await update.message.reply_text(
+                f"ℹ️ Сесій старіших {days} днів немає — нічого видаляти.",
+            )
+            return
+        await update.message.reply_text(
+            f"🔎 <b>Preview</b> — знайдено <code>{would_remove}</code> сесій старіших {days} днів.\n\n"
+            f"Щоб реально видалити — напиши:\n"
+            f"<code>/cleanup {days} confirm</code>",
+            parse_mode="HTML",
         )
         return
 
@@ -2048,7 +2233,7 @@ async def cmd_cleanup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         f"🧹 Видаляю сесії старіші {days} днів...",
     )
 
-    removed, errors = await asyncio.to_thread(_cleanup_old_sessions_sync, days)
+    removed, errors = await asyncio.to_thread(_cleanup_old_sessions_sync, days, False)
 
     if removed == 0 and errors == 0:
         await update.message.reply_text(
