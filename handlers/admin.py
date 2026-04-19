@@ -488,7 +488,15 @@ async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     from html import escape as _h_escape
     for i, h in enumerate(history, 1):
         flag = COUNTRY_FLAGS.get(h["site"], "📍")
-        dt = h["started_at"][:16] if h["started_at"] else "—"
+        # started_at може бути datetime (Python 3.12 SQLite adapters) або str (legacy).
+        # Нормалізуємо до "YYYY-MM-DD HH:MM" безвідносно вхідного типу.
+        _raw = h["started_at"]
+        if _raw is None:
+            dt = "—"
+        elif hasattr(_raw, "strftime"):
+            dt = _raw.strftime("%Y-%m-%d %H:%M")
+        else:
+            dt = str(_raw)[:16]
         kw_safe = _h_escape(str(h['keyword']))
         site_safe = _h_escape(str(h['site']))
         lines.append(f"<code>{i}.</code> {flag} <b>{site_safe}</b> — <code>{kw_safe}</code> x{h['count']} [{dt}]")
