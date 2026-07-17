@@ -22,9 +22,9 @@ import json
 import logging
 import os
 import threading
+from collections.abc import Callable
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Callable
 
 logger = logging.getLogger(__name__)
 
@@ -160,7 +160,7 @@ def _migrate_from_py() -> None:
     Викликається автоматично при першому завантаженні якщо JSON відсутній.
     """
     try:
-        import proxy.settings as _ps  # noqa: PLC0415
+        import proxy.settings as _ps
         data = {
             "use_proxy": bool(getattr(_ps, "USE_PROXY", False)),
             "proxies":   dict(getattr(_ps, "PROXIES", _DEFAULT["proxies"])),

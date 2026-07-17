@@ -10,13 +10,12 @@ handlers_analysis.py — Хендлери Telegram-бота для аналіз�
 from __future__ import annotations
 
 import asyncio
-import io
 import logging
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
-from analysis.doc_analyzer import analyze_document, format_report, check_dependencies
+from analysis.doc_analyzer import analyze_document, check_dependencies, format_report
 
 logger = logging.getLogger(__name__)
 
@@ -253,8 +252,11 @@ def _split_report(text: str, max_len: int) -> list[str]:
 def build_analysis_conversation():
     """Створює ConversationHandler для аналізу документів."""
     from telegram.ext import (
-        ConversationHandler, CommandHandler, CallbackQueryHandler,
-        MessageHandler, filters
+        CallbackQueryHandler,
+        CommandHandler,
+        ConversationHandler,
+        MessageHandler,
+        filters,
     )
 
     return ConversationHandler(

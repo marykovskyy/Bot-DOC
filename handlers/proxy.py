@@ -5,13 +5,12 @@ import re
 import tempfile
 
 import requests
-
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
 import proxy.manager as proxy_manager
-from keyboards import get_proxy_kb, get_check_geo_kb
 from handlers.admin import require_auth
+from keyboards import get_check_geo_kb, get_proxy_kb
 
 logger = logging.getLogger(__name__)
 
@@ -171,7 +170,7 @@ async def proxy_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
             if 'pending_proxy_file' in context.user_data:
                 tmp_path = context.user_data.pop('pending_proxy_file')
                 try:
-                    with open(tmp_path, 'r', encoding='utf-8') as f:
+                    with open(tmp_path, encoding='utf-8') as f:
                         for line in f:
                             m = re.match(parse_pattern, line.strip())
                             if m and _valid_port(m.group(2)):
@@ -347,6 +346,13 @@ async def proxy_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
 
 @require_auth
 async def prompt_for_zip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # Активуємо «режим очікування документів» на 30 хв.
+    # handle_gdrive_link перевіряє цей прапорець перед запуском аналізу,
+    # щоб випадково скопійоване drive-посилання не тригерило аналіз.
+    import time as _time
+    if context.user_data is not None:
+        context.user_data["awaiting_docs_until"] = _time.time() + 1800
+
     text = (
         "📁 **Перевірка фізичних документів (ШІ)**\n\n"
         "Цей модуль перевірить термін дії документів і розсортує їх.\n\n"
@@ -360,7 +366,7 @@ async def prompt_for_zip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         "1. Завантаж ZIP на **Google Drive**\n"
         "2. ПКМ → _Поділитись_ → _Усі хто має посилання_\n"
         "3. Скопіюй посилання і надішли сюди\n\n"
-        "👉 _Чекаю на ZIP-архів або Google Drive посилання..._"
+        "👉 _Чекаю на ZIP-архів або Google Drive посилання_ (30 хв)"
     )
     if update.message:
         await update.message.reply_text(text, parse_mode="Markdown")

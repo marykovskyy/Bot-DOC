@@ -9,8 +9,8 @@ import time
 from datetime import datetime
 
 import gspread
-from gspread.exceptions import APIError, SpreadsheetNotFound
 from google.oauth2.service_account import Credentials
+from gspread.exceptions import APIError, SpreadsheetNotFound
 
 from constants import SHEETS_MAX_RETRIES, SHEETS_RETRY_WAIT_BASE
 

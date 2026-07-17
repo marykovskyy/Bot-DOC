@@ -1,7 +1,7 @@
 import functools
 import logging
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
 import database
@@ -143,12 +143,15 @@ def _section_docs() -> str:
         "\n"
         "*Як використовувати:*\n"
         "1\\. Натисни `\U0001F4C1 Перевірка фіз\\. доків`\n"
+        "   \U000026A0 _Без цієї кнопки посилання Google Drive_\n"
+        "   _не активує аналіз \\(запобігає випадковим запускам\\)_\n"
         "2\\. Підготуй ZIP\\-архів:\n"
         "   • Кожна папка \\= один клієнт\n"
         "   • Всередині — фото документа \\(JPG/PNG\\)\n"
         "   • Назва папки \\= ім'я клієнта\n"
         "3\\. Надішли ZIP у чат \\(до 50 МБ\\)\n"
         "   або посилання Google Drive \\(до 500 МБ\\)\n"
+        "   Вікно очікування після натискання — *30 хв*\n"
         "4\\. Стеж за прогресом у реальному часі\n"
         "5\\. Після завершення обери спосіб доставки:\n"
         "\n"
@@ -198,6 +201,7 @@ def _section_cmds() -> str:
         "`\U0001F4CA Статус бота` — uptime та навантаження\n"
         "`\U0001F4CB Історія` — швидкий доступ до /history\n"
         "`\U0001F310 Налаштування проксі` — керування проксі\n"
+        "`\U0001F504 Перезапустити бота` — тільки адмін\n"
         "\n"
         "\U0001F4A1 _Під час пошуку натисни_ `\U0001F6D1 Зупинити збір` _—_\n"
         "_бот збереже вже знайдені результати та надішле файл_\n"
@@ -273,10 +277,12 @@ def _get_admin_help() -> str:
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         "\n"
         "*Користувачі:*\n"
-        "/users — список з ролями та статусом\n"
+        "/users — список з ролями та статусом \\(🟢 активний / 🔴 заблокований\\)\n"
         "/adduser `<chat\\_id>` — додати як user\n"
         "/adduser `<chat\\_id>` admin — додати як адміна\n"
-        "/removeuser `<chat\\_id>` — заблокувати\n"
+        "_Якщо юзер був заблокований — автоматично реактивується_\n"
+        "/removeuser `<chat\\_id>` — заблокувати \\(не видаляє з БД\\)\n"
+        "/unblockuser `<chat\\_id>` — розблокувати раніше заблокованого\n"
         "\n"
         "*AI Сортер — адмін:*\n"
         "/analysislogs — лог останніх 20 сесій аналізу \\(хто, коли, скільки, результат\\)\n"
@@ -482,7 +488,15 @@ async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     from html import escape as _h_escape
     for i, h in enumerate(history, 1):
         flag = COUNTRY_FLAGS.get(h["site"], "📍")
-        dt = h["started_at"][:16] if h["started_at"] else "—"
+        # started_at може бути datetime (Python 3.12 SQLite adapters) або str (legacy).
+        # Нормалізуємо до "YYYY-MM-DD HH:MM" безвідносно вхідного типу.
+        _raw = h["started_at"]
+        if _raw is None:
+            dt = "—"
+        elif hasattr(_raw, "strftime"):
+            dt = _raw.strftime("%Y-%m-%d %H:%M")
+        else:
+            dt = str(_raw)[:16]
         kw_safe = _h_escape(str(h['keyword']))
         site_safe = _h_escape(str(h['site']))
         lines.append(f"<code>{i}.</code> {flag} <b>{site_safe}</b> — <code>{kw_safe}</code> x{h['count']} [{dt}]")
@@ -503,12 +517,12 @@ async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 @require_auth
 async def repeat_from_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Callback: повторити пошук з історії."""
-    import asyncio
     import threading
-    from scrapers.main import run_scraping
-    from state import scraping_status, _status_lock, MAX_PARALLEL_TASKS
-    from keyboards import get_stop_kb
+
     from handlers.scraping import status_updater
+    from keyboards import get_stop_kb
+    from scrapers.main import run_scraping
+    from state import MAX_PARALLEL_TASKS, _status_lock, scraping_status
 
     query = update.callback_query
     if not query or not query.data or not update.effective_user:
@@ -531,6 +545,27 @@ async def repeat_from_history(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     # Заповнюємо user_data і запускаємо
     if context.user_data is None:
+        return
+    # Для UK: режим PDF/links не зберігається в історії, тому спершу питаємо.
+    # Раніше хардкодно було False — юзер що хотів PDF їх не отримував.
+    if item["site"] == "UnitedKingdom":
+        import uuid as _uuid
+        token = _uuid.uuid4().hex[:10]
+        pending = context.bot_data.setdefault("pending_repeat", {})
+        pending[token] = {"history_id": history_id, "chat_id": chat_id}
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("📥 Завантажити PDF", callback_data=f"rpt_uk_pdf_{token}"),
+            InlineKeyboardButton("🔗 Тільки посилання", callback_data=f"rpt_uk_lnk_{token}"),
+        ]])
+        try:
+            await query.edit_message_text(
+                f"🇬🇧 Повторюємо пошук UK: <code>{item['keyword']}</code>\n\n"
+                f"Обери режим завантаження:",
+                parse_mode="HTML",
+                reply_markup=kb,
+            )
+        except Exception:
+            pass
         return
     context.user_data.update({
         "site": item["site"],
@@ -566,4 +601,242 @@ async def repeat_from_history(update: Update, context: ContextTypes.DEFAULT_TYPE
         daemon=True
     ).start()
 
-    asyncio.create_task(status_updater(context, chat_id, msg.message_id))
+    from state import create_tracked_task
+    create_tracked_task(status_updater(context, chat_id, msg.message_id))
+
+
+async def repeat_uk_mode_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обробляє вибір режиму PDF/links при повторі UK пошуку з історії."""
+    import threading
+    import time as _time
+
+    from handlers.scraping import safe_answer, status_updater
+    from keyboards import get_stop_kb
+    from scrapers.main import run_scraping
+    from state import MAX_PARALLEL_TASKS, _status_lock, scraping_status
+
+    query = update.callback_query
+    if not query or not query.data or not update.effective_user:
+        return
+    await safe_answer(query)
+
+    data = query.data  # rpt_uk_pdf_<token> або rpt_uk_lnk_<token>
+    download_pdf = data.startswith("rpt_uk_pdf_")
+    token = data.rsplit("_", 1)[-1]
+    pending = context.bot_data.get("pending_repeat", {})
+    info = pending.pop(token, None)
+    if not info:
+        try:
+            await query.edit_message_text("⌛ Сесія вибору прострочена. Натисни «Повторити» знову.")
+        except Exception:
+            pass
+        return
+
+    history_id = info["history_id"]
+    chat_id = info["chat_id"]
+    history = database.get_search_history(chat_id, limit=50)
+    item = next((h for h in history if h["id"] == history_id), None)
+    if not item:
+        try:
+            await query.edit_message_text("❌ Запис з історії зник.")
+        except Exception:
+            pass
+        return
+
+    if context.user_data is None:
+        return
+    context.user_data.update({
+        "site": item["site"],
+        "kw": item["keyword"],
+        "count": str(item["count"]),
+        "target_year": item["year"],
+        "uk_download_pdf": download_pdf,
+    })
+
+    async with _status_lock:
+        active_tasks = sum(1 for s in scraping_status.values() if s.get("is_running"))
+        if active_tasks >= MAX_PARALLEL_TASKS:
+            try:
+                await query.edit_message_text("⏳ Черга заповнена, спробуй пізніше.")
+            except Exception:
+                pass
+            return
+        scraping_status[chat_id] = {
+            "current": 0, "max": item["count"],
+            "last_name": "Повтор пошуку...", "is_running": True,
+            "file_path": None, "target_year": item["year"],
+            "uk_download_pdf": download_pdf, "site": item["site"],
+            "started_at": _time.time(),
+        }
+
+    mode_label = "📥 PDF" if download_pdf else "🔗 Посилання"
+    msg = await context.bot.send_message(
+        chat_id=chat_id,
+        text=f"🔄 Повторюю UK пошук ({mode_label}): <code>{item['keyword']}</code>",
+        parse_mode="HTML",
+        reply_markup=get_stop_kb(),
+    )
+    try:
+        await query.delete_message()
+    except Exception:
+        pass
+
+    threading.Thread(
+        target=run_scraping,
+        args=(chat_id, item["keyword"], item["count"],
+              item["site"], item["file_format"], scraping_status[chat_id]),
+        daemon=True,
+    ).start()
+
+    from state import create_tracked_task
+    create_tracked_task(status_updater(context, chat_id, msg.message_id))
+
+
+# ═════════════════════════════════════════════════════════════════════
+#  ⚙️ Налаштування (admin-only)
+# ═════════════════════════════════════════════════════════════════════
+
+@require_auth
+async def settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Reply-button '⚙️ Налаштування' → відкриває inline-меню адмін-дій."""
+    if not update.message:
+        return
+    from keyboards import get_settings_kb
+    await update.message.reply_text(
+        "⚙️ <b>Налаштування</b>\n\n"
+        "Службові дії для адміністратора.",
+        reply_markup=get_settings_kb(),
+        parse_mode="HTML",
+    )
+
+
+@require_auth
+async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обробка кнопок у inline-меню '⚙️ Налаштування'."""
+    from keyboards import get_settings_confirm_clear_kb, get_settings_kb
+
+    query = update.callback_query
+    if not query or not query.data:
+        return
+
+    try:
+        await query.answer()
+    except Exception:
+        pass
+
+    data = query.data
+
+    # ── Закрити меню ──
+    if data == "settings_close":
+        try:
+            await query.delete_message()
+        except Exception:
+            pass
+        return
+
+    # ── Повернутись до головного меню ──
+    if data == "settings_back":
+        try:
+            await query.edit_message_text(
+                "⚙️ <b>Налаштування</b>\n\nСлужбові дії для адміністратора.",
+                reply_markup=get_settings_kb(),
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+        return
+
+    # ── Статистика кешу ──
+    if data == "settings_cache_stats":
+        import sqlite3
+        try:
+            with sqlite3.connect("companies.db") as conn:
+                cur = conn.cursor()
+                cur.execute("SELECT COUNT(*) FROM image_cache")
+                total = cur.fetchone()[0]
+                cur.execute(
+                    "SELECT source, COUNT(*) FROM image_cache "
+                    "GROUP BY source ORDER BY 2 DESC LIMIT 10"
+                )
+                rows = cur.fetchall()
+        except sqlite3.Error as e:
+            await query.edit_message_text(
+                f"❌ Помилка читання БД: {e}",
+                reply_markup=get_settings_kb(),
+            )
+            return
+
+        lines = ["📊 <b>Кеш OCR</b>", "", f"Усього записів: <b>{total}</b>"]
+        if rows:
+            lines.append("")
+            lines.append("<i>Розподіл по джерелу:</i>")
+            for src, n in rows:
+                lines.append(f"  • <code>{n:>6}</code>  {src or '—'}")
+        try:
+            await query.edit_message_text(
+                "\n".join(lines),
+                reply_markup=get_settings_kb(),
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+        return
+
+    # ── Запит підтвердження очистки ──
+    if data == "settings_clear_ocr":
+        import sqlite3
+        try:
+            with sqlite3.connect("companies.db") as conn:
+                count = conn.execute(
+                    "SELECT COUNT(*) FROM image_cache"
+                ).fetchone()[0]
+        except sqlite3.Error:
+            count = 0
+
+        await query.edit_message_text(
+            f"⚠️ <b>Очистити кеш OCR?</b>\n\n"
+            f"Зараз у кеші: <b>{count}</b> записів.\n\n"
+            f"Дія незворотна. Після цього наступний аналіз ZIP-архіву "
+            f"повністю перерахує всі фото з нуля (Local OCR → Textract → Vision). "
+            f"Швидкість тимчасово впаде, AWS Textract витратить кредити.",
+            reply_markup=get_settings_confirm_clear_kb(),
+            parse_mode="HTML",
+        )
+        return
+
+    # ── Підтверджена очистка ──
+    if data == "settings_clear_ocr_confirm":
+        import sqlite3
+        try:
+            with sqlite3.connect("companies.db") as conn:
+                deleted = conn.execute(
+                    "SELECT COUNT(*) FROM image_cache"
+                ).fetchone()[0]
+                conn.execute("DELETE FROM image_cache")
+                conn.commit()
+                # VACUUM поза транзакцією
+                conn.isolation_level = None
+                conn.execute("VACUUM")
+        except sqlite3.Error as e:
+            logger.exception("settings: clear ocr cache failed")
+            await query.edit_message_text(
+                f"❌ Не вдалось очистити кеш: <code>{_esc(str(e))}</code>",
+                reply_markup=get_settings_kb(),
+                parse_mode="HTML",
+            )
+            return
+
+        user = update.effective_user
+        logger.info(
+            "OCR cache cleared by user_id=%s (records deleted: %d)",
+            user.id if user else "?",
+            deleted,
+        )
+        await query.edit_message_text(
+            f"✅ <b>Кеш OCR очищено</b>\n\n"
+            f"Видалено записів: <b>{deleted}</b>\n"
+            f"БД стиснуто (VACUUM).",
+            reply_markup=get_settings_kb(),
+            parse_mode="HTML",
+        )
+        return

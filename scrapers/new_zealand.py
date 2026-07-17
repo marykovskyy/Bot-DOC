@@ -1,6 +1,7 @@
-import time
-import re
 import logging
+import re
+import time
+
 import database
 
 logger = logging.getLogger(__name__)

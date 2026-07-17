@@ -1,4 +1,5 @@
 import os
+
 from dotenv import load_dotenv
 
 load_dotenv("token.env")
@@ -9,6 +10,13 @@ ADMIN_ID = int(os.getenv("TELEGRAM_ADMIN_ID", "0"))
 
 if not TOKEN:
     raise RuntimeError("❌ TELEGRAM_BOT_TOKEN не знайдено в .env файлі!")
+
+# --- Google Maps Platform: Address Validation API ---
+# Опційно. Якщо не задано — функція "перевірка адрес" вимикається graceful'но.
+# Створення: https://console.cloud.google.com/ → проект → APIs & Services →
+# Library → "Address Validation API" → Enable → Credentials → API key.
+# Безкоштовно: 5 000 запитів/міс. Понад: $17 / 1 000 запитів.
+GOOGLE_MAPS_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY", "").strip()
 
 # --- ПУБЛІЧНА КОНФІГУРАЦІЯ СКРАПЕРІВ ---
 SCRAPER_CONFIG = {
@@ -32,7 +40,15 @@ SCRAPER_CONFIG = {
     },
     "California": {
         "flag": "🇺🇸",
+        "group": "USA",
         "search_url": "https://bizfileonline.sos.ca.gov/search/business",
+        "link_selector": "",
+        "name_tag": ""
+    },
+    "Washington": {
+        "flag": "🇺🇸",
+        "group": "USA",
+        "search_url": "https://ccfs.sos.wa.gov/#/AdvancedSearch",
         "link_selector": "",
         "name_tag": ""
     },
@@ -54,6 +70,12 @@ SCRAPER_CONFIG = {
         "link_selector": "",
         "name_tag": ""
     },
+    "Norway": {
+        "flag": "🇳🇴",
+        "search_url": "API",
+        "link_selector": "",
+        "name_tag": ""
+    },
     "NewZealand": {
         "flag": "🇳🇿",
         "search_url": "DrissionPage",
@@ -63,6 +85,18 @@ SCRAPER_CONFIG = {
     "Thailand": {
         "flag": "🇹🇭",
         "search_url": "https://datawarehouse.dbd.go.th/index",
+        "link_selector": "",
+        "name_tag": ""
+    },
+    "Turkey": {
+        "flag": "🇹🇷",
+        "search_url": "https://bilgibankasi.ito.org.tr/tr/bilgi-bankasi/firma-bilgileri",
+        "link_selector": "",
+        "name_tag": ""
+    },
+    "India": {
+        "flag": "🇮🇳",
+        "search_url": "API",   # data.gov.in Open Data (MCA company master data)
         "link_selector": "",
         "name_tag": ""
     },

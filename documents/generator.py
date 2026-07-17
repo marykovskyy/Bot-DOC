@@ -1,455 +1,429 @@
 """
-document_generator.py — Генерація документів із PSD-шаблонів
+generator.py — Генератор сертифікатів (Certificate of Incorporation, India) з .docx-шаблону.
 
-Можливості:
-  - Текстові поля з вирівнюванням, переносом, кольором
-  - Вставка фото у визначену область (type: photo)
-  - Кастомний шрифт на поле (font: "OcrB.ttf")
-  - Автогенерація MRZ (auto: mrz_line1 / mrz_line2)
-  - Валідація полів (validation: {...})
-  - Вивід у PNG / JPEG / PDF
+Замінює попередній PNG-генератор паспортів. Тепер:
+  - Підстановка даних у .docx-шаблон: заміна плейсхолдерів {{...}} у word/document.xml.
+    Форматування, шрифти та зображення шаблону зберігаються повністю — використовується
+    лише stdlib `zipfile`, жодних зовнішніх залежностей для рендеру.
+  - Автогенерація двох дат словами: дата видачі СТРОГО пізніше дати інкорпорації.
+  - Пул підписантів (реєстраторів) — випадковий вибір із config.json.
+  - Парсинг TXT з кількома компаніями → пакетна генерація.
 
-Структура папок:
-  templates/
-    passport_de/
-      background.png
-      config.json
-      fonts/           ← опційна папка з TTF
-        OcrB.ttf
+Структура шаблону:
+  documents/templates/india_incorporation/
+    template.docx   ← .docx з плейсхолдерами {{COMPANY_NAME}}, {{CIN}}, {{ADDRESS}},
+                       {{DATE_INCORP}}, {{DATE_ISSUE}}, {{SIGNATORY}}
+    config.json     ← опис шаблону, пул підписантів, діапазон дат
+
+Поля (config.json → fields):
+  source = "input"           → значення береться з TXT (company_name / cin / address)
+  source = "auto_date"       → дата інкорпорації (генерується)
+  source = "auto_date_after" → дата видачі (генерується строго пізніше інкорпорації)
+  source = "auto_pool"       → випадковий підписант із signatory_pool
 """
 from __future__ import annotations
 
 import io
 import json
 import logging
-import os
+import random
 import re
+import zipfile
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
 
-from PIL import Image, ImageDraw, ImageFont
-
 logger = logging.getLogger(__name__)
 
-# ── Пошук системних шрифтів (TTF) ──────────────────────────────────────
-_FONT_SEARCH_PATHS = [
-    "C:/Windows/Fonts/",
-    "/usr/share/fonts/truetype/dejavu/",
-    "/usr/share/fonts/truetype/liberation/",
-    "/usr/share/fonts/truetype/freefont/",
-    "/Library/Fonts/",
-    "/System/Library/Fonts/",
-]
-_FONT_NAMES_REGULAR = ["Arial.ttf", "arial.ttf", "DejaVuSans.ttf",
-                        "LiberationSans-Regular.ttf", "FreeSans.ttf"]
-_FONT_NAMES_BOLD    = ["Arial Bold.ttf", "arialbd.ttf", "DejaVuSans-Bold.ttf",
-                        "LiberationSans-Bold.ttf", "FreeSansBold.ttf"]
+# ── Числівники англійською (дати словами) ────────────────────────────────
+
+_ONES = ["Zero", "One", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight",
+         "Nine", "Ten", "Eleven", "Twelve", "Thirteen", "Fourteen", "Fifteen",
+         "Sixteen", "Seventeen", "Eighteen", "Nineteen"]
+_TENS = {2: "Twenty", 3: "Thirty", 4: "Forty", 5: "Fifty",
+         6: "Sixty", 7: "Seventy", 8: "Eighty", 9: "Ninety"}
+
+_ORDINAL = {
+    1: "First", 2: "Second", 3: "Third", 4: "Fourth", 5: "Fifth", 6: "Sixth",
+    7: "Seventh", 8: "Eighth", 9: "Ninth", 10: "Tenth", 11: "Eleventh",
+    12: "Twelfth", 13: "Thirteenth", 14: "Fourteenth", 15: "Fifteenth",
+    16: "Sixteenth", 17: "Seventeenth", 18: "Eighteenth", 19: "Nineteenth",
+    20: "Twentieth", 30: "Thirtieth",
+}
+
+_MONTHS = ["", "January", "February", "March", "April", "May", "June",
+           "July", "August", "September", "October", "November", "December"]
 
 
-def _find_system_font(bold: bool = False) -> str | None:
-    candidates = _FONT_NAMES_BOLD if bold else _FONT_NAMES_REGULAR
-    for folder in _FONT_SEARCH_PATHS:
-        for name in candidates:
-            path = os.path.join(folder, name)
-            if os.path.isfile(path):
-                return path
-    return None
+def _two_digit_words(n: int) -> str:
+    """0..99 → 'Twenty Five' (Title Case)."""
+    if n < 20:
+        return _ONES[n]
+    t, o = divmod(n, 10)
+    return _TENS[t] + (" " + _ONES[o] if o else "")
 
 
-def _load_system_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont:
-    path = _find_system_font(bold)
-    if path:
-        try:
-            return ImageFont.truetype(path, size)
-        except Exception:
-            pass
-    logger.warning("TTF шрифт не знайдено, використовую стандартний bitmap.")
-    return ImageFont.load_default()
+def ordinal_words(n: int) -> str:
+    """День місяця 1..31 → 'Thirteenth' / 'Twenty First' (Title Case)."""
+    if n in _ORDINAL:
+        return _ORDINAL[n]
+    t, o = divmod(n, 10)               # 21..29, 31
+    return _TENS[t] + " " + _ORDINAL[o]
 
 
-# ── Валідація полів ─────────────────────────────────────────────────────
+def year_words(y: int) -> str:
+    """Рік 2000..2099 → 'Two Thousand Twenty Five' (Title Case)."""
+    if 2000 <= y <= 2099:
+        rem = y - 2000
+        return "Two Thousand" + (" " + _two_digit_words(rem) if rem else "")
+    return str(y)                       # fallback для нетипових років
 
-def validate_field(value: str, rules: dict) -> str | None:
-    """Перевіряє значення поля за правилами validation.
 
-    Returns:
-        Повідомлення про помилку або None якщо валідне.
+def _cap_first_only(s: str) -> str:
+    """'Two Thousand Twenty One' → 'Two thousand twenty one'."""
+    return s[:1].upper() + s[1:].lower()
+
+
+def format_date_incorp(d: date) -> str:
+    """Формат дати інкорпорації: 'Thirteenth Day of June Two Thousand Twenty Five'."""
+    return f"{ordinal_words(d.day)} Day of {_MONTHS[d.month]} {year_words(d.year)}"
+
+
+def format_date_issue(d: date) -> str:
+    """Формат дати видачі: 'Eleventh day of June Two thousand twenty one'."""
+    return f"{ordinal_words(d.day)} day of {_MONTHS[d.month]} {_cap_first_only(year_words(d.year))}"
+
+
+def generate_dates(min_year: int = 2016, max_year: int = 2025,
+                   issue_offset_days: tuple[int, int] = (1, 60),
+                   fixed_year: int | None = None) -> tuple[str, str, date, date]:
+    """Генерує пару дат: (str_інкорпорації, str_видачі, date_інкорпорації, date_видачі).
+
+    Гарантії:
+      - дата видачі СТРОГО пізніше дати інкорпорації (offset >= 1 день, тому не рівні);
+      - різниця у розумних межах issue_offset_days.
+
+    Якщо fixed_year задано (напр. рік із CIN), дата інкорпорації генерується
+    строго в межах цього року, а min_year/max_year ігноруються.
     """
-    if not rules:
+    if fixed_year is not None:
+        start = date(fixed_year, 1, 1)
+        end = date(fixed_year, 12, 31)
+    else:
+        start = date(min_year, 1, 1)
+        end = date(max_year, 12, 31)
+    span = (end - start).days
+    incorp = start + timedelta(days=random.randint(0, max(span, 0)))
+
+    low, high = issue_offset_days
+    low = max(1, int(low))              # мінімум 1 день → строго пізніше й не рівні
+    high = max(low, int(high))
+    issue = incorp + timedelta(days=random.randint(low, high))
+
+    return format_date_incorp(incorp), format_date_issue(issue), incorp, issue
+
+
+# ── Парсер TXT з кількома компаніями ─────────────────────────────────────
+
+# CIN Індії: U55101KL2025PTC095056 — літера + 5 цифр + 2 літери + 4 цифри + 3 літери + 6 цифр
+_CIN_RE = re.compile(r"^[A-Za-z]\d{5}[A-Za-z]{2}\d{4}[A-Za-z]{3}\d{6}$")
+
+
+def cin_year(cin: str) -> int | None:
+    """Рік реєстрації з CIN (4 цифри в позиціях 9–12, напр. ...2025...).
+
+    Повертає None, якщо CIN не відповідає формату або рік поза 2000–2099
+    (у такому разі дати генеруються за діапазоном config.json).
+    """
+    if not cin:
         return None
+    c = cin.replace(" ", "")
+    if not _CIN_RE.match(c):
+        return None
+    year = int(c[8:12])
+    return year if 2000 <= year <= 2099 else None
 
-    if "max_length" in rules and len(value) > rules["max_length"]:
-        return f"Максимум {rules['max_length']} символів (введено {len(value)})"
+_KEY_ALIASES: dict[str, set[str]] = {
+    "company_name": {
+        "company", "company name", "name", "назва", "назва компанії",
+        "название", "название компании", "компания", "компанія", "наименование",
+    },
+    "cin": {"cin", "cin number", "cin no", "cin номер", "кін"},
+    "address": {
+        "address", "addr", "mailing address", "адрес", "адреса",
+        "почтовый адрес", "поштова адреса",
+    },
+}
 
-    if "min_length" in rules and len(value) < rules["min_length"]:
-        return f"Мінімум {rules['min_length']} символів (введено {len(value)})"
-
-    if "length" in rules and len(value) != rules["length"]:
-        return f"Потрібно рівно {rules['length']} символів (введено {len(value)})"
-
-    if "choices" in rules:
-        allowed = [c.upper() for c in rules["choices"]]
-        if value.upper() not in allowed:
-            return f"Допустимі значення: {', '.join(rules['choices'])}"
-
-    if "pattern" in rules:
-        if not re.match(rules["pattern"], value):
-            return rules.get("hint", "Невірний формат")
-
-    return None
+# Рядок-роздільник у «красивому» експорті скрапера (═══ / ─── / ─ тощо).
+_SEP_LINE_RE = re.compile(r"^[═─—–\-=_*·•]{3,}$")
+# Службовий рядок-лічильник заголовка ("Зібрано компаній: N").
+_COUNTER_RE = re.compile(r"^(зібрано|собрано|collected)\s+компан", re.IGNORECASE)
+# Заголовок компанії у форматі експорту: "#1  COMPANY NAME".
+_NUM_TITLE_RE = re.compile(r"^#\s*\d+\s+(.+)$")
 
 
-# ── Генератор документів ────────────────────────────────────────────────
+def _canon_key(raw: str) -> str:
+    """Нормалізує ключ рядка 'Company Name' → 'company_name' (або '' якщо невідомий)."""
+    s = re.sub(r"\s+", " ", raw.strip().lower().replace("_", " "))
+    for field, aliases in _KEY_ALIASES.items():
+        if s in aliases:
+            return field
+    return ""
 
-class DocumentGenerator:
+
+def parse_companies_txt(text: str) -> list[dict[str, str]]:
+    """Розбирає TXT з кількома компаніями → список {'company_name','cin','address'}.
+
+    Приймає ДВА формати:
+
+    1) Простий (ручний) — блоки, розділені порожнім рядком. У блоці:
+         - 'ключ: значення' (Company / CIN / Address; двокрапка або '='), або
+         - просто 3 рядки поспіль (назва, CIN, адреса) позиційно.
+
+    2) «Красивий» експорт скрапера (кнопка TXT у результатах пошуку):
+           ════════════════════════════════════
+             Зібрано компаній: 50
+           ════════════════════════════════════
+
+           #1  ATMA CONSTRUCTION SYSTEM PRIVATE LIMITED
+               CIN              : U45309MP2020PTC053349
+               Статус           : ACTIVE
+               Адреса           : 56 G SANOUSI ...
+               Посилання на PDF : https://www.mca.gov.in/ (verify by CIN)
+           ────────────────────────────────────
+           #2  ...
+       Тут блоки розділені лінією-роздільником (═══/───), заголовок має
+       префікс '#N', а зайві поля (Статус, Клас, Штат, RoC, Посилання…)
+       ігноруються — беруться лише назва (#N), CIN та Адреса.
+
+    CIN розпізнається автоматично за форматом, навіть без ключа.
+    Блоки без назви компанії пропускаються.
     """
-    Генератор документів із PNG-фону + JSON-конфігу.
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
 
-    Підтримує:
-      - Текстові поля (x, y, font_size, bold, color, align, max_width)
-      - Поля з фото (type: photo, x, y, width, height)
-      - Кастомні шрифти (font: "OcrB.ttf" → шукає в template/fonts/)
-      - Автополя MRZ (auto: mrz_line1 / mrz_line2)
-      - Вивід у PNG / JPEG / PDF
-    """
+    # Лінії-роздільники (═══/───) трактуємо як межу блоку — так формат
+    # експорту скрапера (де компанії розділені лінією, а не порожнім рядком)
+    # теж коректно розбивається на блоки.
+    text = "\n".join(
+        "" if _SEP_LINE_RE.match(ln.strip()) else ln
+        for ln in text.split("\n")
+    )
 
-    def __init__(self, template_dir: str | Path, font_path: str | None = None):
+    companies: list[dict[str, str]] = []
+
+    for block in re.split(r"\n\s*\n", text.strip()):
+        lines = [ln.strip() for ln in block.split("\n") if ln.strip()]
+        # службовий рядок-лічильник заголовка ("Зібрано компаній: N") → геть
+        lines = [ln for ln in lines if not _COUNTER_RE.match(ln)]
+        if not lines:
+            continue
+
+        rec = {"company_name": "", "cin": "", "address": ""}
+        positional: list[str] = []
+        # «Красивий» блок пізнається за заголовком '#N NAME'. У ньому кожен
+        # рядок — це поле, тож незнані мітки (Статус, Штат, RoC, Посилання…)
+        # відкидаємо, а не зливаємо в адресу.
+        pretty = any(_NUM_TITLE_RE.match(ln) for ln in lines)
+
+        # 1) рядки виду '#N NAME' та 'ключ: значення'
+        for ln in lines:
+            m_title = _NUM_TITLE_RE.match(ln)
+            if m_title:
+                name = m_title.group(1).strip()
+                if name and name != "—" and not rec["company_name"]:
+                    rec["company_name"] = name
+                continue
+
+            m = re.match(r"^([^:=]{1,40})[:=]\s*(.+)$", ln)
+            if m:
+                key = _canon_key(m.group(1))
+                val = m.group(2).strip()
+                if key:
+                    if not rec[key]:
+                        rec[key] = val
+                    continue
+                if pretty:
+                    continue          # незнане поле експорту → ігноруємо
+            elif pretty:
+                continue              # у «красивому» блоці голих рядків не буває
+            positional.append(ln)
+
+        # 2) автовизначення CIN серед позиційних рядків
+        for ln in list(positional):
+            if not rec["cin"] and _CIN_RE.match(ln.replace(" ", "")):
+                rec["cin"] = ln.replace(" ", "").upper()
+                positional.remove(ln)
+
+        # 3) решта позиційних → назва, потім адреса (зайві рядки додаються до адреси)
+        for ln in positional:
+            if not rec["company_name"]:
+                rec["company_name"] = ln
+            elif not rec["address"]:
+                rec["address"] = ln
+            else:
+                rec["address"] += " " + ln
+
+        if rec["company_name"]:
+            companies.append(rec)
+
+    return companies
+
+
+# ── Робота з .docx (лише stdlib zipfile) ─────────────────────────────────
+
+def _xml_escape(s: str) -> str:
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _sanitize_filename(s: str, maxlen: int = 60) -> str:
+    keep = "".join(c for c in s if c.isalnum() or c in " _-").strip()
+    keep = re.sub(r"\s+", "_", keep)
+    return (keep[:maxlen] or "document").rstrip("_")
+
+
+# ── Шаблон сертифіката ───────────────────────────────────────────────────
+
+class CertificateTemplate:
+    """Один .docx-шаблон із плейсхолдерами {{...}} + правила заповнення з config.json."""
+
+    def __init__(self, template_dir: str | Path):
         self.template_dir = Path(template_dir)
-        self.font_path_override = font_path
-
-        bg_path = self.template_dir / "background.png"
         cfg_path = self.template_dir / "config.json"
-
-        if not bg_path.exists():
-            raise FileNotFoundError(f"background.png не знайдено: {bg_path}")
         if not cfg_path.exists():
             raise FileNotFoundError(f"config.json не знайдено: {cfg_path}")
 
         with open(cfg_path, encoding="utf-8") as f:
             self.config: dict = json.load(f)
 
-        self._bg_image: Image.Image = Image.open(str(bg_path)).convert("RGBA")
-        self._font_cache: dict[tuple, ImageFont.FreeTypeFont] = {}
+        tpl_name = self.config.get("template_file", "template.docx")
+        self.template_file = self.template_dir / tpl_name
+        if not self.template_file.exists():
+            raise FileNotFoundError(f"{tpl_name} не знайдено: {self.template_file}")
 
-        logger.info("DocumentGenerator: шаблон '%s' завантажено (%d полів)",
-                    self.config.get("name", template_dir),
-                    len(self.config.get("fields", {})))
+        self._template_bytes = self.template_file.read_bytes()
+        self.signatory_pool: list[str] = list(self.config.get("signatory_pool", []))
 
-    # ── Шрифти ────────────────────────────────────────────────────────
+        dr = self.config.get("date_range", {})
+        self._min_year = int(dr.get("min_year", 2016))
+        self._max_year = int(dr.get("max_year", 2025))
+        off = dr.get("issue_offset_days", [1, 60])
+        self._issue_offset = (int(off[0]), int(off[1]))
 
-    def _get_font(self, size: int, bold: bool,
-                  custom_font: str | None = None) -> ImageFont.FreeTypeFont:
-        """Завантажує шрифт з кешем.
+        logger.info("CertificateTemplate '%s' завантажено (%d полів, %d підписантів)",
+                    self.config.get("name", self.template_dir.name),
+                    len(self.config.get("fields", {})), len(self.signatory_pool))
 
-        Пошук:
-          1. custom_font → template_dir/fonts/ → системні папки
-          2. font_path_override (конструктор)
-          3. Системний шрифт (Arial / DejaVu / FreeSans)
+    # ── метадані ──
+    @property
+    def name(self) -> str:
+        return self.config.get("name", self.template_dir.name)
+
+    @property
+    def description(self) -> str:
+        return self.config.get("description", self.name)
+
+    def input_fields(self) -> list[tuple[str, dict]]:
+        """Поля, що заповнюються з TXT (source == 'input')."""
+        return [(k, c) for k, c in self.config.get("fields", {}).items()
+                if c.get("source") == "input"]
+
+    # ── резолвинг значень → {token: value} ──
+    def _resolve(self, provided: dict[str, Any]) -> dict[str, str]:
+        fields: dict = self.config.get("fields", {})
+        # Якщо у CIN є рік реєстрації — прив'язуємо дату інкорпорації до нього,
+        # щоб рік у CIN і згенерована дата не суперечили одне одному.
+        year = cin_year(str(provided.get("cin", "") or ""))
+        s_incorp, s_issue, _, _ = generate_dates(
+            self._min_year, self._max_year, self._issue_offset, fixed_year=year)
+        signatory = random.choice(self.signatory_pool) if self.signatory_pool else ""
+
+        tokens: dict[str, str] = {}
+        for key, cfg in fields.items():
+            placeholder = cfg.get("placeholder")
+            if not placeholder:
+                continue
+            source = cfg.get("source", "input")
+            if source == "auto_date":
+                val = provided.get(key) or s_incorp
+            elif source == "auto_date_after":
+                val = provided.get(key) or s_issue
+            elif source == "auto_pool":
+                val = provided.get(key) or signatory
+            else:  # input
+                val = provided.get(key, cfg.get("default", ""))
+            tokens[placeholder] = str(val)
+        return tokens
+
+    # ── рендер одного документа ──
+    def render(self, data: dict[str, Any]) -> bytes:
+        """Заповнює шаблон і повертає .docx-байти.
+
+        data: {'company_name','cin','address', ...}. Авто-поля (дати, підписант)
+        генеруються, якщо не передані явно.
         """
-        key = (size, bold, custom_font or "")
-        if key in self._font_cache:
-            return self._font_cache[key]
+        token_values = self._resolve(data)
+        return self._apply(token_values)
 
-        font: ImageFont.FreeTypeFont | None = None
+    def _apply(self, token_values: dict[str, str]) -> bytes:
+        src = io.BytesIO(self._template_bytes)
+        out = io.BytesIO()
+        with zipfile.ZipFile(src) as zin, \
+             zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zout:
+            for item in zin.infolist():
+                content = zin.read(item.filename)
+                if item.filename == "word/document.xml":
+                    text = content.decode("utf-8")
+                    for token, value in token_values.items():
+                        text = text.replace(token, _xml_escape(value))
+                    content = text.encode("utf-8")
+                zout.writestr(item, content)
+        return out.getvalue()
 
-        # 1. Кастомний шрифт з конфігу поля
-        if custom_font:
-            # Шукаємо в папці шаблону
-            local_path = self.template_dir / "fonts" / custom_font
-            if local_path.is_file():
-                try:
-                    font = ImageFont.truetype(str(local_path), size)
-                except Exception:
-                    pass
-            # Шукаємо в системних папках
-            if not font:
-                for folder in _FONT_SEARCH_PATHS:
-                    sys_path = os.path.join(folder, custom_font)
-                    if os.path.isfile(sys_path):
-                        try:
-                            font = ImageFont.truetype(sys_path, size)
-                            break
-                        except Exception:
-                            pass
+    def render_pdf(self, data: dict[str, Any]) -> bytes:
+        """Заповнює шаблон і повертає PDF-байти (через LibreOffice).
 
-        # 2. Override з конструктора
-        if not font and self.font_path_override:
+        Викликає pdf_convert.PdfConversionError, якщо LibreOffice недоступний.
+        """
+        from documents import pdf_convert
+        return pdf_convert.convert_one(self.render(data))
+
+    # ── пакетна генерація ──
+    def render_many(self, companies: list[dict[str, Any]]) -> list[tuple[str, bytes]]:
+        """Рендерить документ для кожної компанії → [(filename.docx, bytes), ...]."""
+        results: list[tuple[str, bytes]] = []
+        for i, company in enumerate(companies, 1):
             try:
-                font = ImageFont.truetype(self.font_path_override, size)
-            except Exception:
-                pass
+                doc = self.render(company)
+                fname = f"{i:03d}_{_sanitize_filename(company.get('company_name', ''))}.docx"
+                results.append((fname, doc))
+            except Exception as e:
+                logger.warning("render_many: компанія #%d помилка: %s", i, e)
+        return results
 
-        # 3. Системний шрифт
-        if not font:
-            font = _load_system_font(size, bold)
+    def render_zip(self, companies: list[dict[str, Any]], fmt: str = "docx") -> bytes:
+        """Пакетна генерація → ZIP-байти.
 
-        self._font_cache[key] = font
-        return font
-
-    # ── Текст ─────────────────────────────────────────────────────────
-
-    @staticmethod
-    def _wrap_text(text: str, font: ImageFont.FreeTypeFont,
-                   max_width: int, draw: ImageDraw.ImageDraw) -> list[str]:
-        if not max_width:
-            return [text]
-        words = text.split()
-        lines: list[str] = []
-        current = ""
-        for word in words:
-            test = (current + " " + word).strip()
-            bbox = draw.textbbox((0, 0), test, font=font)
-            if bbox[2] - bbox[0] <= max_width:
-                current = test
-            else:
-                if current:
-                    lines.append(current)
-                current = word
-        if current:
-            lines.append(current)
-        return lines or [text]
-
-    @staticmethod
-    def _draw_text_aligned(draw: ImageDraw.ImageDraw, x: int, y: int,
-                           text: str, font: ImageFont.FreeTypeFont,
-                           color: tuple, align: str) -> None:
-        bbox = draw.textbbox((0, 0), text, font=font)
-        w = bbox[2] - bbox[0]
-        if align == "right":
-            x = x - w
-        elif align == "center":
-            x = x - w // 2
-        draw.text((x, y), text, font=font, fill=color)
-
-    # ── Авто-поля (computed, MRZ, дати) ─────────────────────────────
-
-    @staticmethod
-    def _compute_auto_fields(data: dict, fields_cfg: dict) -> dict:
-        """Обчислює авто-поля на основі інших полів.
-
-        Підтримувані auto-типи:
-          - "mrz_line1" / "mrz_line2" — MRZ ICAO 9303
-          - "today"                   — сьогоднішня дата (DD.MM.YYYY)
-          - "expiry_10y"              — issue_date + 10 років
-          - "nationality_from_country"— мапінг country_code → nationality
-          - "doc_number_random"       — випадковий номер у форматі C00X00T00
+        fmt='docx' (типово) — .docx-файли; fmt='pdf' — конвертує кожен документ
+        у PDF через LibreOffice (pdf_convert). Для 'pdf' потрібен встановлений
+        LibreOffice; інакше — pdf_convert.PdfConversionError.
         """
-        from datetime import datetime, timedelta
-        import random
+        rendered = self.render_many(companies)
+        if fmt.lower() == "pdf":
+            from documents import pdf_convert
+            rendered = pdf_convert.convert_docx_to_pdf(rendered)
 
-        auto_fields = {k: v for k, v in fields_cfg.items() if v.get("auto")}
-        if not auto_fields:
-            return data
-
-        # ── Прості авто-поля (до MRZ, бо MRZ залежить від них) ────
-        _NATIONALITY_MAP = {
-            "D": "DEUTSCH", "DEU": "DEUTSCH",
-            "F": "FRANCAIS", "FRA": "FRANCAIS",
-            "I": "ITALIANO", "ITA": "ITALIANO",
-            "E": "ESPANOL", "ESP": "ESPANOL",
-            "P": "PORTUGUES", "PRT": "PORTUGUES",
-            "NL": "NEDERLANDER", "NLD": "NEDERLANDER",
-            "B": "BELGE", "BEL": "BELGE",
-            "A": "OSTERREICHISCH", "AUT": "OSTERREICHISCH",
-            "CH": "SCHWEIZER", "CHE": "SCHWEIZER",
-            "GBR": "BRITISH", "GB": "BRITISH",
-            "USA": "AMERICAN", "US": "AMERICAN",
-            "POL": "POLSKIE", "PL": "POLSKIE",
-            "UKR": "UKRAINETS", "UA": "UKRAINETS",
-            "CZE": "CESKE", "CZ": "CESKE",
-            "ROU": "ROMAN", "RO": "ROMAN",
-        }
-
-        for field_key, cfg in auto_fields.items():
-            auto_type = cfg["auto"]
-
-            if auto_type == "today":
-                data.setdefault(field_key, datetime.now().strftime("%d.%m.%Y"))
-
-            elif auto_type == "expiry_10y":
-                # Береться з issue_date або з сьогодні
-                issue_str = data.get("issue_date", "")
-                try:
-                    if '.' in issue_str:
-                        parts = issue_str.split('.')
-                        issue_dt = datetime(int(parts[2]), int(parts[1]), int(parts[0]))
-                    else:
-                        issue_dt = datetime.now()
-                    expiry_dt = issue_dt.replace(year=issue_dt.year + 10)
-                    data.setdefault(field_key, expiry_dt.strftime("%d.%m.%Y"))
-                except Exception:
-                    data.setdefault(field_key, datetime.now().strftime("%d.%m.%Y"))
-
-            elif auto_type == "nationality_from_country":
-                cc = data.get("country_code", "").upper().strip()
-                nat = _NATIONALITY_MAP.get(cc, cc)
-                data.setdefault(field_key, nat)
-
-            elif auto_type == "doc_number_random":
-                # Генеруємо номер у форматі C##X##T## (9 символів, як німецький)
-                letters = "CFGHJKLMNPRTVWXYZ"
-                num = (
-                    random.choice(letters)
-                    + f"{random.randint(0,9)}{random.randint(0,9)}"
-                    + random.choice(letters)
-                    + f"{random.randint(0,9)}{random.randint(0,9)}"
-                    + random.choice(letters)
-                    + f"{random.randint(0,9)}{random.randint(0,9)}"
-                )
-                data.setdefault(field_key, num)
-
-            elif auto_type == "fixed":
-                # Фіксоване значення з default — юзер не вводить
-                data.setdefault(field_key, cfg.get("default", ""))
-
-        # ── MRZ (залежить від інших полів, тому рахуємо останнім) ──
-        from analysis.mrz_utils import generate_mrz_td3
-
-        has_mrz = any(v.get("auto", "").startswith("mrz_line") for v in auto_fields.values())
-        if has_mrz:
-            line1, line2 = generate_mrz_td3(
-                doc_type=data.get("doc_type", "P"),
-                country=data.get("country_code", data.get("country", "")),
-                surname=data.get("surname", ""),
-                given_name=data.get("given_name", ""),
-                doc_number=data.get("doc_number", ""),
-                nationality=data.get("nationality", ""),
-                birth_date=data.get("birth_date", ""),
-                sex=data.get("sex", ""),
-                expiry_date=data.get("expiry_date", ""),
-            )
-
-        for field_key, cfg in auto_fields.items():
-            auto_type = cfg["auto"]
-            if auto_type == "mrz_line1":
-                data[field_key] = line1
-            elif auto_type == "mrz_line2":
-                data[field_key] = line2
-
-        return data
-
-    # ── Фото ──────────────────────────────────────────────────────────
-
-    @staticmethod
-    def _paste_photo(img: Image.Image, photo_bytes: bytes,
-                     x: int, y: int, width: int, height: int) -> None:
-        """Вставляє фото у визначену область, масштабуючи під розмір."""
-        try:
-            photo = Image.open(io.BytesIO(photo_bytes)).convert("RGBA")
-            photo = photo.resize((width, height), Image.Resampling.LANCZOS)
-            img.paste(photo, (x, y), photo)
-        except Exception as e:
-            logger.error("Помилка вставки фото: %s", e)
-
-    # ── Публічний API ─────────────────────────────────────────────────
-
-    def render(self, data: dict[str, Any], output_format: str = "PNG") -> bytes:
-        """
-        Генерує документ.
-
-        Args:
-            data: {field_name: value} — str для тексту, bytes для фото
-            output_format: "PNG", "JPEG" або "PDF"
-
-        Returns:
-            bytes — готове зображення / PDF
-        """
-        fields_cfg: dict = self.config.get("fields", {})
-
-        # Обчислюємо авто-поля (MRZ тощо)
-        data = self._compute_auto_fields(dict(data), fields_cfg)
-
-        img = self._bg_image.copy()
-        draw = ImageDraw.Draw(img)
-
-        for field_name, cfg in fields_cfg.items():
-            field_type = cfg.get("type", "text")
-
-            # ── Фото ──
-            if field_type == "photo":
-                photo_data = data.get(field_name)
-                if isinstance(photo_data, (bytes, bytearray)):
-                    self._paste_photo(
-                        img, bytes(photo_data),
-                        int(cfg.get("x", 0)), int(cfg.get("y", 0)),
-                        int(cfg.get("width", 200)), int(cfg.get("height", 260)),
-                    )
-                continue
-
-            # ── Текст ──
-            text = str(data.get(field_name, ""))
-            if not text:
-                continue
-
-            x          = int(cfg.get("x", 0))
-            y          = int(cfg.get("y", 0))
-            font_size  = int(cfg.get("font_size", 16))
-            bold       = bool(cfg.get("bold", False))
-            color_cfg  = cfg.get("color", [0, 0, 0])[:3]
-            align      = str(cfg.get("align", "left"))
-            max_width  = int(cfg.get("max_width", 0))
-            line_gap   = int(cfg.get("line_gap", 6))
-            custom_font = cfg.get("font")  # ← кастомний шрифт для цього поля
-
-            color = tuple(color_cfg) + (255,)
-            font  = self._get_font(font_size, bold, custom_font)
-
-            if max_width:
-                lines = self._wrap_text(text, font, max_width, draw)
-            else:
-                lines = [text]
-
-            cur_y = y
-            for line in lines:
-                self._draw_text_aligned(draw, x, cur_y, line, font, color, align)
-                bbox = draw.textbbox((0, 0), line, font=font)
-                line_h = bbox[3] - bbox[1]
-                cur_y += line_h + line_gap
-
-        # ── Зберігаємо ──
-        buf = io.BytesIO()
-        fmt = output_format.upper()
-        if fmt == "JPEG":
-            img.convert("RGB").save(buf, format="JPEG", quality=95)
-        elif fmt == "PDF":
-            img.convert("RGB").save(buf, format="PDF", resolution=self.config.get("dpi", 150))
-        else:
-            img.save(buf, format="PNG", optimize=True)
-        buf.seek(0)
-
-        logger.info("Документ '%s' згенеровано (%s, %d байт)",
-                    self.config.get("name", "?"), fmt, buf.tell())
-        return buf.getvalue()
-
-    def preview(self, output_format: str = "PNG") -> bytes:
-        """Превью з placeholder-текстом [назва_поля]."""
-        placeholders: dict[str, Any] = {}
-        for name, cfg in self.config.get("fields", {}).items():
-            if cfg.get("auto"):
-                continue  # авто-поля пропускаємо — вони обчисляться
-            if cfg.get("type") == "photo":
-                continue  # фото не вставляємо в превью
-            placeholders[name] = f"[{name}]"
-        return self.render(placeholders, output_format)
-
-    def get_input_fields(self) -> list[tuple[str, dict]]:
-        """Повертає список полів для введення (без auto-полів).
-
-        Returns:
-            [(field_key, field_cfg), ...] — тільки ті поля, які юзер заповнює.
-        """
-        result = []
-        for key, cfg in self.config.get("fields", {}).items():
-            if cfg.get("auto"):
-                continue  # MRZ та інші авто-поля пропускаємо
-            result.append((key, cfg))
-        return result
+        zip_buf = io.BytesIO()
+        with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for fname, doc in rendered:
+                zf.writestr(fname, doc)
+        return zip_buf.getvalue()
 
 
-# ── Реєстр шаблонів ────────────────────────────────────────────────────
+# ── Реєстр шаблонів (сумісність із bot.py) ───────────────────────────────
 
 _TEMPLATES_DIR = Path(__file__).parent / "templates"
-_registry: dict[str, DocumentGenerator] = {}
+_registry: dict[str, CertificateTemplate] = {}
 
 
 def load_all_templates(templates_dir: str | Path = _TEMPLATES_DIR) -> None:
@@ -459,18 +433,48 @@ def load_all_templates(templates_dir: str | Path = _TEMPLATES_DIR) -> None:
         logger.warning("Папка templates/ не знайдена: %s", base)
         return
     for folder in base.iterdir():
-        if folder.is_dir():
-            try:
-                gen = DocumentGenerator(folder)
-                _registry[folder.name] = gen
-                logger.info("Шаблон завантажено: %s", folder.name)
-            except FileNotFoundError as e:
-                logger.warning("Пропускаємо %s: %s", folder.name, e)
+        if not folder.is_dir():
+            continue
+        cfg_path = folder / "config.json"
+        if not cfg_path.exists():
+            continue
+        # Визначаємо файл шаблону, щоб тихо пропускати не-docx теки
+        # (напр. залишки старих PNG-шаблонів без template.docx).
+        try:
+            with open(cfg_path, encoding="utf-8") as f:
+                tpl_file = json.load(f).get("template_file", "template.docx")
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not (folder / tpl_file).exists():
+            logger.debug("Пропускаю теку без .docx-шаблону: %s", folder.name)
+            continue
+        try:
+            _registry[folder.name] = CertificateTemplate(folder)
+            logger.info("Шаблон завантажено: %s", folder.name)
+        except (FileNotFoundError, json.JSONDecodeError) as e:
+            logger.warning("Пропускаю %s: %s", folder.name, e)
 
 
-def get_template(name: str) -> DocumentGenerator | None:
+def get_template(name: str) -> CertificateTemplate | None:
     return _registry.get(name)
 
 
 def list_templates() -> list[str]:
     return list(_registry.keys())
+
+
+# ── Приклад TXT для користувача ──────────────────────────────────────────
+
+SAMPLE_TXT = """\
+Company: COMFYVALLEY PRIVATE LIMITED
+CIN: U55101KL2025PTC095056
+Address: BUILDING NO. AP X/286,VETTUROAD, KANIYAPURAM,Thiruvananthapuram,Kerala,695582-India
+
+Company: GREENLEAF TRADING PRIVATE LIMITED
+CIN: U74999MH2022PTC123456
+Address: 12 MG ROAD, ANDHERI EAST, Mumbai, Maharashtra, 400069-India
+
+Company: BLUEHARBOR LOGISTICS PRIVATE LIMITED
+CIN: U63030DL2021PTC987654
+Address: PLOT 45, SECTOR 18, Dwarka, New Delhi, Delhi, 110078-India
+"""

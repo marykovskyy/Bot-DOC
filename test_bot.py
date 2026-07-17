@@ -72,7 +72,7 @@ class TestWithRetry:
         def flaky_fn():
             counter.append(1)
             if len(counter) < 2:
-                raise IOError("tmp")
+                raise OSError("tmp")
             return "ok"
 
         result = retry_request(flaky_fn, max_retries=3, delay=0)
@@ -89,11 +89,17 @@ class TestConstants:
 
     def test_all_constants_present(self):
         from constants import (
-            MAX_PARALLEL_TASKS, STATUS_UPDATE_SEC,
-            CAPTCHA_MAX_WAIT_SEC, CAPTCHA_POLL_INTERVAL_SEC,
-            ELEMENT_WAIT_RETRIES, BROWSER_LAUNCH_TIMEOUT_SEC,
-            SHEETS_MAX_RETRIES, SHEETS_RETRY_WAIT_BASE, SHEETS_WRITE_DELAY,
-            AI_MAX_CONCURRENT_API, AI_PROGRESS_UPDATE_SEC,
+            AI_MAX_CONCURRENT_API,
+            AI_PROGRESS_UPDATE_SEC,
+            BROWSER_LAUNCH_TIMEOUT_SEC,
+            CAPTCHA_MAX_WAIT_SEC,
+            CAPTCHA_POLL_INTERVAL_SEC,
+            ELEMENT_WAIT_RETRIES,
+            MAX_PARALLEL_TASKS,
+            SHEETS_MAX_RETRIES,
+            SHEETS_RETRY_WAIT_BASE,
+            SHEETS_WRITE_DELAY,
+            STATUS_UPDATE_SEC,
         )
         assert MAX_PARALLEL_TASKS >= 1
         assert CAPTCHA_MAX_WAIT_SEC > CAPTCHA_POLL_INTERVAL_SEC
@@ -271,101 +277,186 @@ class TestDatabase:
 #  document_generator.py
 # ─────────────────────────────────────────────────────────────────────────────
 
-class TestDocumentGenerator:
-    """Тести генератора документів (без реального PNG — мокуємо PIL)."""
+class TestCertificateGenerator:
+    """Тести генератора сертифікатів (.docx-шаблон: підстановка + авто-поля)."""
 
-    def _make_template_dir(self, tmp_path: Path) -> Path:
-        """Створює мінімальний валідний шаблон у tmp_path."""
-        tpl_dir = tmp_path / "test_tpl"
-        tpl_dir.mkdir()
+    def _tpl(self):
+        from documents import generator as g
+        g.load_all_templates()
+        tpl = g.get_template("india_incorporation")
+        assert tpl is not None, "шаблон india_incorporation не завантажено"
+        return tpl
 
-        # Мінімальний 10×10 RGBA PNG у пам'яті
-        from PIL import Image
-        img = Image.new("RGBA", (200, 100), (255, 255, 255, 255))
-        img.save(str(tpl_dir / "background.png"))
+    @staticmethod
+    def _document_xml(docx_bytes: bytes) -> str:
+        import io
+        import zipfile
+        return zipfile.ZipFile(io.BytesIO(docx_bytes)).read("word/document.xml").decode("utf-8")
 
-        config = {
-            "name": "test_tpl",
-            "description": "Тестовий шаблон",
-            "fields": {
-                "name": {
-                    "label": "Ім'я",
-                    "default": "Іван",
-                    "x": 10, "y": 10,
-                    "font_size": 14, "bold": False,
-                    "color": [0, 0, 0], "align": "left"
-                },
-                "date": {
-                    "label": "Дата",
-                    "default": "01.01.2026",
-                    "x": 150, "y": 10,
-                    "font_size": 12, "bold": False,
-                    "color": [50, 50, 50], "align": "right"
-                }
-            }
-        }
-        (tpl_dir / "config.json").write_text(
-            json.dumps(config, ensure_ascii=False), encoding="utf-8"
-        )
-        return tpl_dir
+    def test_template_loads(self):
+        tpl = self._tpl()
+        assert tpl.config["name"] == "india_incorporation"
+        assert tpl.signatory_pool, "пул підписантів порожній"
 
-    def test_load_template(self, tmp_path):
-        from documents.generator import DocumentGenerator
-        tpl_dir = self._make_template_dir(tmp_path)
-        gen = DocumentGenerator(tpl_dir)
-        assert gen.config["name"] == "test_tpl"
-        assert "name" in gen.config["fields"]
+    def test_render_returns_docx_bytes(self):
+        tpl = self._tpl()
+        out = tpl.render({"company_name": "TEST PRIVATE LIMITED",
+                          "cin": "U12345KL2020PTC000001",
+                          "address": "1 ROAD, Kerala, 600001-India"})
+        assert isinstance(out, bytes)
+        assert out[:2] == b"PK"          # ZIP/OOXML magic
 
-    def test_render_returns_bytes(self, tmp_path):
-        from documents.generator import DocumentGenerator
-        tpl_dir = self._make_template_dir(tmp_path)
-        gen = DocumentGenerator(tpl_dir)
-        result = gen.render({"name": "Тест", "date": "06.04.2026"})
-        assert isinstance(result, bytes)
-        assert len(result) > 0
+    def test_no_placeholders_left(self):
+        import re
+        tpl = self._tpl()
+        xml = self._document_xml(tpl.render({"company_name": "X PRIVATE LIMITED"}))
+        assert not re.search(r"\{\{[^}]+\}\}", xml)
 
-    def test_render_png_magic_bytes(self, tmp_path):
-        from documents.generator import DocumentGenerator
-        tpl_dir = self._make_template_dir(tmp_path)
-        gen = DocumentGenerator(tpl_dir)
-        result = gen.render({"name": "Test"})
-        # PNG завжди починається з \x89PNG
-        assert result[:4] == b"\x89PNG"
+    def test_company_name_substituted_twice(self):
+        tpl = self._tpl()
+        xml = self._document_xml(tpl.render(
+            {"company_name": "UNIQUENAME PRIVATE LIMITED", "address": "addr"}))
+        # у тексті сертифіката + у блоці адреси
+        assert xml.count("UNIQUENAME PRIVATE LIMITED") == 2
 
-    def test_preview_uses_field_names_as_placeholders(self, tmp_path):
-        from documents.generator import DocumentGenerator
-        tpl_dir = self._make_template_dir(tmp_path)
-        gen = DocumentGenerator(tpl_dir)
-        # preview() повинна не кидати виключень
-        result = gen.preview()
-        assert isinstance(result, bytes)
+    def test_ampersand_escaped(self):
+        tpl = self._tpl()
+        xml = self._document_xml(tpl.render({"company_name": "A & B PRIVATE LIMITED"}))
+        assert "A &amp; B PRIVATE LIMITED" in xml
 
-    def test_font_cache_populated_after_render(self, tmp_path):
-        from documents.generator import DocumentGenerator
-        tpl_dir = self._make_template_dir(tmp_path)
-        gen = DocumentGenerator(tpl_dir)
-        assert len(gen._font_cache) == 0
-        gen.render({"name": "Test", "date": "2026"})
-        assert len(gen._font_cache) > 0
+    def test_signatory_from_pool(self):
+        tpl = self._tpl()
+        pool = set(tpl.signatory_pool)
+        xml = self._document_xml(tpl.render({"company_name": "X PRIVATE LIMITED"}))
+        assert any(name in xml for name in pool)
 
-    def test_missing_background_raises(self, tmp_path):
-        from documents.generator import DocumentGenerator
-        tpl_dir = tmp_path / "no_bg"
-        tpl_dir.mkdir()
-        (tpl_dir / "config.json").write_text('{"fields":{}}')
-        with pytest.raises(FileNotFoundError, match="background.png"):
-            DocumentGenerator(tpl_dir)
+    def test_issue_date_strictly_after_incorporation(self):
+        from documents import generator as g
+        for _ in range(1000):
+            _, _, di, ii = g.generate_dates(2016, 2025, (1, 60))
+            assert ii > di
 
-    def test_rgba_color_no_5tuple(self, tmp_path):
-        """Поле з color: [R, G, B, A] не повинно падати з 5-tuple."""
-        from documents.generator import DocumentGenerator
-        tpl_dir = self._make_template_dir(tmp_path)
-        cfg = json.loads((tpl_dir / "config.json").read_text())
-        cfg["fields"]["name"]["color"] = [0, 0, 0, 255]   # 4 значення
-        (tpl_dir / "config.json").write_text(json.dumps(cfg))
-        gen = DocumentGenerator(tpl_dir)
-        result = gen.render({"name": "Test"})   # не повинно кидати
-        assert isinstance(result, bytes)
+    def test_ordinal_and_year_words(self):
+        from documents import generator as g
+        assert g.ordinal_words(13) == "Thirteenth"
+        assert g.ordinal_words(21) == "Twenty First"
+        assert g.ordinal_words(31) == "Thirty First"
+        assert g.year_words(2025) == "Two Thousand Twenty Five"
+        assert g.year_words(2000) == "Two Thousand"
+
+    def test_date_word_formats(self):
+        from datetime import date
+
+        from documents import generator as g
+        assert (g.format_date_incorp(date(2025, 6, 13))
+                == "Thirteenth Day of June Two Thousand Twenty Five")
+        assert (g.format_date_issue(date(2021, 6, 11))
+                == "Eleventh day of June Two thousand twenty one")
+
+    def test_parse_companies_keyed(self):
+        from documents import generator as g
+        txt = ("Company: FOO PRIVATE LIMITED\nCIN: U12345KL2020PTC000001\n"
+               "Address: 1 ROAD, Kerala\n\n"
+               "Company: BAR PRIVATE LIMITED\nCIN: U67890MH2021PTC000002\n"
+               "Address: 2 ROAD, Mumbai\n")
+        comps = g.parse_companies_txt(txt)
+        assert len(comps) == 2
+        assert comps[0]["company_name"] == "FOO PRIVATE LIMITED"
+        assert comps[1]["cin"] == "U67890MH2021PTC000002"
+
+    def test_parse_companies_positional_with_cin_autodetect(self):
+        from documents import generator as g
+        txt = "ACME PRIVATE LIMITED\nU12345KL2020PTC000001\n9 ROAD, Kerala, 600001-India\n"
+        comps = g.parse_companies_txt(txt)
+        assert len(comps) == 1
+        assert comps[0]["company_name"] == "ACME PRIVATE LIMITED"
+        assert comps[0]["cin"] == "U12345KL2020PTC000001"
+        assert "9 ROAD" in comps[0]["address"]
+
+    def test_parse_companies_scraper_txt_export(self):
+        """«Красивий» TXT-експорт скрапера (кнопка TXT) приймається напряму:
+        назва береться з '#N', CIN/адреса — з міток, зайві поля ігноруються."""
+        from documents import generator as g
+        from scrapers.main import _format_txt_readable
+
+        records = [
+            {"Назва": "ATMA CONSTRUCTION SYSTEM PRIVATE LIMITED",
+             "CIN": "U45309MP2020PTC053349", "Статус": "ACTIVE",
+             "Дата реєстрації": "2020-10-20", "Клас": "Private",
+             "Категорія": "Company limited by shares", "Штат": "madhya pradesh",
+             "RoC": "ROC Gwalior",
+             "Адреса": "56 G SANOUSI SEMARIHA TOLA SHAHDOL,Shahdol,Madhya Pradesh,484774-India",
+             "Посилання на PDF": "https://www.mca.gov.in/  (verify by CIN)"},
+            {"Назва": "SVGLINE - UP PRIVATE LIMITED",
+             "CIN": "U74999UP2021PTC155012", "Статус": "ACTIVE",
+             "Дата реєстрації": "2021-03-11", "Клас": "Private",
+             "Категорія": "Company limited by shares", "Штат": "uttar pradesh",
+             "RoC": "ROC Kanpur",
+             "Адреса": "12 MG ROAD, LUCKNOW, Uttar Pradesh, 226001-India",
+             "Посилання на PDF": "https://www.mca.gov.in/  (verify by CIN)"},
+        ]
+        comps = g.parse_companies_txt(_format_txt_readable(records))
+        assert len(comps) == 2  # рядок-лічильник заголовка не рахується як компанія
+        assert comps[0]["company_name"] == "ATMA CONSTRUCTION SYSTEM PRIVATE LIMITED"
+        assert comps[0]["cin"] == "U45309MP2020PTC053349"
+        assert comps[0]["address"].startswith("56 G SANOUSI")
+        # зайві поля не мають потрапляти в адресу
+        for junk in ("ACTIVE", "ROC", "mca.gov.in", "Private", "madhya"):
+            assert junk not in comps[0]["address"]
+        assert comps[1]["company_name"] == "SVGLINE - UP PRIVATE LIMITED"
+        assert comps[1]["cin"] == "U74999UP2021PTC155012"
+        assert comps[1]["address"].startswith("12 MG ROAD")
+
+    def test_render_zip_batch(self):
+        import io
+        import zipfile
+
+        from documents import generator as g
+        tpl = self._tpl()
+        comps = g.parse_companies_txt(g.SAMPLE_TXT)
+        zf = zipfile.ZipFile(io.BytesIO(tpl.render_zip(comps)))
+        assert len(zf.namelist()) == len(comps)
+        assert all(n.endswith(".docx") for n in zf.namelist())
+
+    def test_pdf_name_helper(self):
+        """Заміна розширення .docx→.pdf не залежить від наявності LibreOffice."""
+        from documents import pdf_convert
+        assert pdf_convert._pdf_name("001_FOO.docx") == "001_FOO.pdf"
+        assert pdf_convert._pdf_name("002_BAR.DOCX") == "002_BAR.pdf"
+
+    def test_render_pdf_single(self):
+        """render_pdf повертає валідний PDF (пропускається без LibreOffice)."""
+        import pytest
+
+        from documents import generator as g
+        from documents import pdf_convert
+        if not pdf_convert.pdf_available():
+            pytest.skip("LibreOffice не встановлено — PDF-конвертація недоступна")
+
+        tpl = self._tpl()
+        comps = g.parse_companies_txt(g.SAMPLE_TXT)
+        pdf = tpl.render_pdf(comps[0])
+        assert pdf[:5] == b"%PDF-"
+
+    def test_render_zip_pdf_batch(self):
+        """render_zip(fmt='pdf') → ZIP з валідних PDF (пропускається без LibreOffice)."""
+        import io
+        import zipfile
+
+        import pytest
+
+        from documents import generator as g
+        from documents import pdf_convert
+        if not pdf_convert.pdf_available():
+            pytest.skip("LibreOffice не встановлено — PDF-конвертація недоступна")
+
+        tpl = self._tpl()
+        comps = g.parse_companies_txt(g.SAMPLE_TXT)
+        zf = zipfile.ZipFile(io.BytesIO(tpl.render_zip(comps, fmt="pdf")))
+        names = zf.namelist()
+        assert len(names) == len(comps)
+        assert all(n.endswith(".pdf") for n in names)
+        assert all(zf.read(n)[:5] == b"%PDF-" for n in names)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -376,8 +467,9 @@ class TestGsheetsRetry:
     """Тести backoff+jitter+Retry-After без реальних HTTP-викликів."""
 
     def test_compute_wait_uses_retry_after_header(self):
-        from gsheets import _compute_wait
         from gspread.exceptions import APIError
+
+        from gsheets import _compute_wait
 
         # Фейковий response з Retry-After: 7
         resp = MagicMock()
@@ -387,8 +479,9 @@ class TestGsheetsRetry:
         assert wait == 7.0
 
     def test_compute_wait_caps_retry_after(self):
-        from gsheets import _compute_wait, _MAX_RETRY_WAIT
         from gspread.exceptions import APIError
+
+        from gsheets import _MAX_RETRY_WAIT, _compute_wait
 
         resp = MagicMock()
         resp.headers = {"Retry-After": "9999"}  # сервер каже чекати 2.7 год
@@ -397,7 +490,7 @@ class TestGsheetsRetry:
 
     def test_compute_wait_fallback_exponential(self):
         """Без Retry-After — експоненціал з jitter."""
-        from gsheets import _compute_wait, _RETRY_WAIT_BASE, _MAX_RETRY_WAIT
+        from gsheets import _MAX_RETRY_WAIT, _RETRY_WAIT_BASE, _compute_wait
 
         wait0 = _compute_wait(0, None)
         wait2 = _compute_wait(2, None)
@@ -408,8 +501,9 @@ class TestGsheetsRetry:
 
     def test_compute_wait_invalid_retry_after(self):
         """Retry-After: 'abc' → fallback на exponential без краху."""
-        from gsheets import _compute_wait
         from gspread.exceptions import APIError
+
+        from gsheets import _compute_wait
 
         resp = MagicMock()
         resp.headers = {"Retry-After": "not-a-number"}
@@ -427,7 +521,10 @@ class TestScrapingValidators:
 
     def test_constants_defined(self):
         from handlers.scraping import (
-            _MAX_KEYWORD_LEN, _MAX_COUNT, _MIN_YEAR, _MAX_YEAR,
+            _MAX_COUNT,
+            _MAX_KEYWORD_LEN,
+            _MAX_YEAR,
+            _MIN_YEAR,
         )
         assert _MAX_KEYWORD_LEN > 0
         assert _MAX_COUNT >= 100
@@ -504,8 +601,9 @@ class TestDatabaseDatetime:
             pass
 
     def test_company_date_is_datetime_after_read(self):
-        import database
         from datetime import datetime
+
+        import database
         database.save_company_to_db("TestCo", "http://example.com/x1", "France")
         with database.get_connection() as conn:
             row = conn.execute(
@@ -516,8 +614,9 @@ class TestDatabaseDatetime:
         assert isinstance(row["date_added"], datetime)
 
     def test_get_new_companies_limit_respected(self):
-        import database
         from datetime import datetime, timedelta
+
+        import database
         for i in range(5):
             database.save_company_to_db(f"C{i}", f"http://ex.com/{i}", "France")
         since = datetime.now() - timedelta(days=1)
@@ -532,8 +631,9 @@ class TestDatabaseDatetime:
 class TestWithRetryJitter:
     def test_jitter_zero_no_variance(self):
         """jitter=0 — sleep робиться рівно на delay."""
-        from utils import with_retry
         import time as _t
+
+        from utils import with_retry
         calls = [0.0]
 
         @with_retry(max_retries=2, delay=0.1, jitter=0)
@@ -599,6 +699,7 @@ class TestAuthorization:
     def test_require_auth_blocks_unknown_user(self):
         """@require_auth викликає reply_text з «Доступ заборонено», func не виконується."""
         import asyncio
+
         from handlers.admin import require_auth
 
         called = []
@@ -628,6 +729,7 @@ class TestAuthorization:
     def test_require_auth_allows_whitelisted_user(self):
         """Юзер у БД is_active=1 → хендлер викликається."""
         import asyncio
+
         import database
         from handlers.admin import require_auth
 
