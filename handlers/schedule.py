@@ -10,14 +10,14 @@ handlers_schedule.py — Планувальник задач та дайджес
 import logging
 from datetime import datetime, timedelta
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ContextTypes
 from apscheduler.triggers.cron import CronTrigger
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import ContextTypes
 
 import database
-from scrapers.main import run_scraping
-from state import scraping_status, _status_lock, _scheduler, _BOT_TZ
 from handlers.admin import require_auth
+from scrapers.main import run_scraping
+from state import _BOT_TZ, _scheduler, _status_lock, scraping_status
 
 logger = logging.getLogger(__name__)
 

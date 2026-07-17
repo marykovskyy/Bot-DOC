@@ -5,13 +5,12 @@ import re
 import tempfile
 
 import requests
-
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
 import proxy.manager as proxy_manager
-from keyboards import get_proxy_kb, get_check_geo_kb
 from handlers.admin import require_auth
+from keyboards import get_check_geo_kb, get_proxy_kb
 
 logger = logging.getLogger(__name__)
 
@@ -171,7 +170,7 @@ async def proxy_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
             if 'pending_proxy_file' in context.user_data:
                 tmp_path = context.user_data.pop('pending_proxy_file')
                 try:
-                    with open(tmp_path, 'r', encoding='utf-8') as f:
+                    with open(tmp_path, encoding='utf-8') as f:
                         for line in f:
                             m = re.match(parse_pattern, line.strip())
                             if m and _valid_port(m.group(2)):

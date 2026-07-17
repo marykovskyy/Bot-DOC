@@ -179,6 +179,26 @@ def scrape_france_api(keyword: str, max_count: int, status_dict: dict) -> list[d
             siren: str = item.get("siren", "")
             siege: dict = item.get("siege") or {}
 
+            # ── Фільтр країни адреси: тільки siège у Франції ──
+            # Реєстр містить компанії, зареєстровані у FR, але з юр. адресою
+            # за кордоном (напр. "Etats-Unis"). Для верифікації потрібна саме
+            # французька адреса — інакше команда вручну відкриває кожен док.
+            code_pays = (siege.get("code_pays") or "").strip().upper()
+            pays      = (siege.get("pays") or "").strip().lower()
+            _addr_blob = " ".join(str(siege.get(k, "")) for k in
+                                  ("adresse_ligne_1", "adresse_ligne_2", "ville", "pays")).lower()
+            _foreign_markers = ("etats-unis", "états-unis", "usa", "united states",
+                                "royaume-uni", "allemagne", "espagne", "belgique",
+                                "suisse", "luxembourg", "pays-bas", "italie")
+            is_foreign = False
+            if (code_pays and code_pays != "FR") or (pays and pays != "france") or (not code_pays and not pays and any(m in _addr_blob for m in _foreign_markers)):
+                is_foreign = True
+            if is_foreign:
+                status_dict["filtered_foreign"] = status_dict.get("filtered_foreign", 0) + 1
+                logger.info("Франція: пропуск (адреса не FR): %s | pays=%r code=%r",
+                            name, siege.get("pays"), code_pays)
+                continue
+
             naf_code  = item.get("code_naf", "")
             naf_label = item.get("libelle_code_naf", "")
             naf = f"{naf_code} — {naf_label}" if naf_code else ""

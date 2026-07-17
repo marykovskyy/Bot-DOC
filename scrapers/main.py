@@ -1,34 +1,40 @@
 from __future__ import annotations
-import time
-import os
-import asyncio
-import tempfile
-import random
-import logging
-import pandas as pd
-import threading
-from typing import Optional, List, Set, Dict, Any
 
-from config import SCRAPER_CONFIG
-from constants import (
-    CAPTCHA_MAX_WAIT_SEC, CAPTCHA_POLL_INTERVAL_SEC,
-    ELEMENT_WAIT_RETRIES, BROWSER_LAUNCH_TIMEOUT_SEC,
-    SHEETS_WRITE_DELAY,
-)
-from DrissionPage import ChromiumPage, ChromiumOptions  # type: ignore[import]
-import proxy.manager as proxy_manager
-from scrapers.california import scrape_california
-from scrapers.denmark import scrape_denmark
-from scrapers.czech import scrape_czech
-from scrapers.uk_api import scrape_uk_api
-from scrapers.latvia import scrape_latvia
-from scrapers.new_zealand import scrape_new_zealand
-from scrapers.thailand import scrape_thailand
-from scrapers.france import scrape_france_api   # ← API-скрапер (pappers.ai JSON)
-from scrapers.finland import scrape_finland_api  # ← API-скрапер (PRH open data)
-from scrapers import turkey as turkey_scraper
+import asyncio
+import logging
+import os
+import random
+import re
+import tempfile
+import threading
+import time
+from typing import Any
+
+import pandas as pd
+from DrissionPage import ChromiumOptions, ChromiumPage  # type: ignore[import]
+
 import database
 import gsheets
+import proxy.manager as proxy_manager
+from config import SCRAPER_CONFIG
+from constants import (
+    CAPTCHA_MAX_WAIT_SEC,
+    CAPTCHA_POLL_INTERVAL_SEC,
+    SHEETS_WRITE_DELAY,
+)
+from scrapers import turkey as turkey_scraper
+from scrapers.california import scrape_california
+from scrapers.czech import scrape_czech
+from scrapers.denmark import scrape_denmark
+from scrapers.finland import scrape_finland_api  # ← API-скрапер (PRH open data)
+from scrapers.france import scrape_france_api  # ← API-скрапер (pappers.ai JSON)
+from scrapers.india import scrape_india_api  # ← API-скрапер (data.gov.in / MCA)
+from scrapers.latvia import scrape_latvia
+from scrapers.new_zealand import scrape_new_zealand
+from scrapers.norway import scrape_norway_api  # ← API-скрапер (Brreg open data)
+from scrapers.thailand import scrape_thailand
+from scrapers.uk_api import scrape_uk_api
+from scrapers.washington import scrape_washington
 
 logger = logging.getLogger(__name__)
 
@@ -123,18 +129,22 @@ class LocalProxyRelay:
     """
 
     def __init__(self, upstream_host: str, upstream_port: int,
-                 username: str, password: str):
+                 username: str, password: str,
+                 upstream_protocol: str = "http"):
         self.upstream_host = upstream_host
         self.upstream_port = upstream_port
+        self.upstream_protocol = (upstream_protocol or "http").lower()
+        self.username = username or ""
+        self.password = password or ""
         import base64 as _b64
         creds = _b64.b64encode(f"{username}:{password}".encode()).decode()
         self._auth_header = (
             b"Proxy-Authorization: Basic " + creds.encode() + b"\r\n"
         )
         self.local_port = self._free_port()
-        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._loop: asyncio.AbstractEventLoop | None = None
         self._server = None
-        self._thread: Optional[threading.Thread] = None
+        self._thread: threading.Thread | None = None
         self._stopped = False
 
     @staticmethod
@@ -212,11 +222,84 @@ class LocalProxyRelay:
             t1.cancel()
             t2.cancel()
 
+    async def _socks5_connect(self, upstream_r: asyncio.StreamReader,
+                              upstream_w: asyncio.StreamWriter,
+                              dest_host: str, dest_port: int) -> bool:
+        """SOCKS5 handshake → CONNECT до dest_host:dest_port (RFC 1928 + RFC 1929).
+
+        Повертає True якщо upstream підтвердив тунель.
+        """
+        # 1. Greeting: VER=5, NMETHODS=2, methods=[0=NoAuth, 2=User/Pass]
+        upstream_w.write(b"\x05\x02\x00\x02")
+        await upstream_w.drain()
+        resp = await asyncio.wait_for(upstream_r.readexactly(2), timeout=10.0)
+        if resp[0] != 0x05:
+            logger.warning("SOCKS5: upstream не SOCKS5 (ver=%d)", resp[0])
+            return False
+        method = resp[1]
+        if method == 0xFF:
+            logger.warning("SOCKS5: upstream відхилив методи аутентифікації")
+            return False
+
+        # 2. Якщо потрібна user/pass — відправляємо
+        if method == 0x02:
+            user = self.username.encode("utf-8")
+            pwd = self.password.encode("utf-8")
+            auth_req = bytes([0x01, len(user)]) + user + bytes([len(pwd)]) + pwd
+            upstream_w.write(auth_req)
+            await upstream_w.drain()
+            auth_resp = await asyncio.wait_for(upstream_r.readexactly(2), timeout=10.0)
+            if auth_resp[1] != 0x00:
+                logger.warning("SOCKS5: auth failed (status=%d)", auth_resp[1])
+                return False
+        elif method != 0x00:
+            logger.warning("SOCKS5: непідтриманий method %d", method)
+            return False
+
+        # 3. CONNECT request: VER=5, CMD=1, RSV=0, ATYP=3 (domain), domain, port
+        host_b = dest_host.encode("idna") if dest_host else b""
+        if len(host_b) > 255:
+            logger.warning("SOCKS5: domain занадто довгий")
+            return False
+        req = (
+            b"\x05\x01\x00\x03"
+            + bytes([len(host_b)]) + host_b
+            + dest_port.to_bytes(2, "big")
+        )
+        upstream_w.write(req)
+        await upstream_w.drain()
+
+        # 4. Response: VER, REP, RSV, ATYP, BND.ADDR, BND.PORT
+        head = await asyncio.wait_for(upstream_r.readexactly(4), timeout=10.0)
+        if head[1] != 0x00:
+            REP_MSGS = {
+                1: "general failure", 2: "not allowed by ruleset",
+                3: "network unreachable", 4: "host unreachable",
+                5: "connection refused", 6: "TTL expired",
+                7: "command not supported", 8: "address type not supported",
+            }
+            logger.warning("SOCKS5: CONNECT відмовлено: %s",
+                           REP_MSGS.get(head[1], f"code={head[1]}"))
+            return False
+        # Дочитуємо BND.ADDR + BND.PORT (різна довжина за ATYP)
+        atyp = head[3]
+        if atyp == 0x01:    # IPv4
+            await upstream_r.readexactly(4 + 2)
+        elif atyp == 0x03:  # domain
+            ln = (await upstream_r.readexactly(1))[0]
+            await upstream_r.readexactly(ln + 2)
+        elif atyp == 0x04:  # IPv6
+            await upstream_r.readexactly(16 + 2)
+        else:
+            logger.warning("SOCKS5: невідомий ATYP=%d", atyp)
+            return False
+        return True
+
     async def _handle(self,
                       client_r: asyncio.StreamReader,
                       client_w: asyncio.StreamWriter) -> None:
-        upstream_r: Optional[asyncio.StreamReader] = None
-        upstream_w: Optional[asyncio.StreamWriter] = None
+        upstream_r: asyncio.StreamReader | None = None
+        upstream_w: asyncio.StreamWriter | None = None
         try:
             # 1. Читаємо заголовки від Chrome
             head = await self._read_until_blank_line(client_r, timeout=30.0)
@@ -231,6 +314,53 @@ class LocalProxyRelay:
                 timeout=15.0
             )
 
+            # ── SOCKS5 шлях ──────────────────────────────────────────────
+            if self.upstream_protocol in ("socks5", "socks5h"):
+                if method != b"CONNECT":
+                    # Chrome для HTTP без TLS теж шле GET напряму, не CONNECT.
+                    # Парсимо Host: header щоб витягнути dest:port.
+                    host_line = b""
+                    for line in head.split(b"\r\n"):
+                        if line.lower().startswith(b"host:"):
+                            host_line = line[5:].strip()
+                            break
+                    if not host_line:
+                        return
+                    if b":" in host_line:
+                        h, _, p = host_line.partition(b":")
+                        dest_host, dest_port = h.decode(), int(p)
+                    else:
+                        dest_host, dest_port = host_line.decode(), 80
+                    if not await self._socks5_connect(upstream_r, upstream_w,
+                                                     dest_host, dest_port):
+                        return
+                    # Пересилаємо оригінальний HTTP-запит (без auth header — SOCKS вже автентифікував)
+                    upstream_w.write(head)
+                    await upstream_w.drain()
+                else:
+                    # CONNECT host:port HTTP/1.1
+                    target = head.split(b" ")[1].decode()
+                    dest_host, _, dest_port_s = target.partition(":")
+                    dest_port = int(dest_port_s) if dest_port_s else 443
+                    if not await self._socks5_connect(upstream_r, upstream_w,
+                                                     dest_host, dest_port):
+                        # Сигналізуємо клієнту що тунель не вдалось підняти
+                        try:
+                            client_w.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+                            await client_w.drain()
+                        except Exception:
+                            pass
+                        return
+                    # Тунель OK — повідомляємо Chrome
+                    client_w.write(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                    await client_w.drain()
+
+                # Двосторонній relay
+                await self._relay_bidirectional(client_r, client_w,
+                                                upstream_r, upstream_w)
+                return
+
+            # ── HTTP/HTTPS upstream шлях (як було) ──────────────────────
             # 3. Пересилаємо запит з авторизацією
             upstream_w.write(self._inject_auth(head))
             await upstream_w.drain()
@@ -254,7 +384,7 @@ class LocalProxyRelay:
             await self._relay_bidirectional(client_r, client_w,
                                             upstream_r, upstream_w)
 
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.warning("Proxy relay timeout (upstream=%s:%d)",
                            self.upstream_host, self.upstream_port)
         except (ConnectionResetError, BrokenPipeError):
@@ -363,7 +493,7 @@ class LocalProxyRelay:
                                self.local_port)
 
 
-def get_page(chat_id: int, status_dict: dict, site_key: str = "General") -> tuple[Optional[ChromiumPage], Optional["LocalProxyRelay"]]:
+def get_page(chat_id: int, status_dict: dict, site_key: str = "General") -> tuple[ChromiumPage | None, LocalProxyRelay | None]:
     """
     Запускає Chrome з проксі через LocalProxyRelay.
 
@@ -388,14 +518,14 @@ def get_page(chat_id: int, status_dict: dict, site_key: str = "General") -> tupl
     use_proxy   = _proxy_data.get("use_proxy", False)
     proxies_dict = _proxy_data.get("proxies", {})
 
-    available_proxies: List[dict] = []
+    available_proxies: list[dict] = []
     if use_proxy:
         if isinstance(proxies_dict, dict):
             available_proxies = proxies_dict.get(site_key, []) or proxies_dict.get("General", [])
         elif isinstance(proxies_dict, list):
             available_proxies = proxies_dict
 
-    relay: Optional[LocalProxyRelay] = None
+    relay: LocalProxyRelay | None = None
 
     if use_proxy and available_proxies:
         p = random.choice(available_proxies)
@@ -403,16 +533,18 @@ def get_page(chat_id: int, status_dict: dict, site_key: str = "General") -> tupl
         port = int(p["port"])
         user = p.get("user", "")
         password = p.get("pass", "")
+        protocol = (p.get("protocol") or "http").lower()
 
         # Запускаємо relay ДО старту Chrome
-        relay = LocalProxyRelay(host, port, user, password)
+        relay = LocalProxyRelay(host, port, user, password,
+                                upstream_protocol=protocol)
         local_port = relay.start()
 
         # Chrome підключається до localhost без пароля
         options.set_proxy(f"http://127.0.0.1:{local_port}")
 
-        logger.info("[Proxy %s] Relay 127.0.0.1:%d → %s:%d (user: %s)",
-                    site_key, local_port, host, port, user or "—")
+        logger.info("[Proxy %s] Relay 127.0.0.1:%d → %s://%s:%d (user: %s)",
+                    site_key, local_port, protocol, host, port, user or "—")
     else:
         logger.info("Проксі для %s відсутні або вимкнені.", site_key)
 
@@ -491,17 +623,130 @@ def check_and_wait_for_captcha(page: ChromiumPage) -> None:
 # ─────────────────────────────────────────────
 
 def _get_link_key(item: dict) -> str:
-    """Визначає правильний ключ посилання залежно від скрапера."""
-    for key in ("Statement of Information (Link)", "Посилання на PDF", "Посилання"):
-        if key in item:
+    """Визначає правильний ключ посилання залежно від скрапера.
+
+    Для скраперів з кількома типами документів (як Washington — Annual + Express)
+    повертає перший НЕ-порожній і НЕ-плейсхолдер ключ. Це гарантує що
+    Sheets не отримає '—' замість реального посилання.
+    """
+    for key in (
+        "Statement of Information (Link)",
+        "Annual Report (Link)",
+        "Express Annual Report (Link)",
+        "Посилання на PDF",
+        "Посилання",
+    ):
+        v = item.get(key)
+        if isinstance(v, str) and v and v != "—":
             return key
     return ""
 
 
-def _persist_result(item: dict, site_key: str, collected_data: List[dict]) -> None:
+def _build_full_address(item: dict) -> tuple[str, str]:
+    """Збирає повну адресу + поштовий індекс з результату скрапера.
+
+    Різні скрапери складають по-різному:
+      France/Finland: "Адреса" (вулиця) + "Місто" + "Поштовий індекс"
+      Czech/UK/Latvia/NZ: "Адреса" (одним рядком, вже містить все)
+      Washington: "Address" + "City" + "State" + "Zip" (US-стиль)
+      California: "Address" (одним рядком після додавання нашим патчем)
+      Denmark: "Адреса" + "Місто" + "Поштовий індекс" (після нашого патча)
+
+    Повертає (full_address_str, postal_code).
+    """
+    parts: list[str] = []
+    # Перш за все шукаємо вулицю (різні назви ключів)
+    for k in ("Address", "Адреса", "Street", "PrincipalOfficeAddress"):
+        v = item.get(k)
+        if isinstance(v, str) and v.strip() and v.strip() != "—":
+            parts.append(v.strip())
+            break
+    # Місто
+    for k in ("City", "Місто"):
+        v = item.get(k)
+        if isinstance(v, str) and v.strip():
+            parts.append(v.strip())
+            break
+    # State (US)
+    state = item.get("State", "") or ""
+    if isinstance(state, str) and state.strip():
+        parts.append(state.strip())
+    # Zip / Поштовий індекс
+    postal = ""
+    for k in ("Zip", "ZIP", "Поштовий індекс", "PostalCode"):
+        v = item.get(k)
+        if isinstance(v, str) and v.strip():
+            postal = v.strip()
+            parts.append(postal)
+            break
+
+    return (", ".join(parts), postal)
+
+
+def _validate_address_for_item(item: dict, site_key: str, status_dict: dict) -> None:
+    """Викликає Google Address Validation API, додає колонки в item.
+
+    Колонки що додаються:
+      - "Address Status"  → 🟢 OK / 🟡 Risk / 🔴 Bad / ⚙️ Не налаштовано
+      - "Address Reason"  → коротка причина
+      - "Place ID"        → Google Maps Place ID (для ручного обліку)
+      - "Formatted Address" → канонічна адреса від Google
+
+    Безпечно: будь-який exception ловиться, аналіз продовжує.
+    """
+    try:
+        from analysis.address_validator import (
+            SITE_TO_REGION,
+            validate_address_sync,
+        )
+    except Exception as e:
+        logger.warning("address_validator import failed: %s", e)
+        return
+
+    address, postal = _build_full_address(item)
+    if not address:
+        # Адреси нема → пишемо явно щоб юзер бачив
+        item["Address Status"] = "⏭ Skipped"
+        item["Address Reason"] = "no_address"
+        return
+
+    region = SITE_TO_REGION.get(site_key, "US")
+
+    try:
+        result = validate_address_sync(address, region, postal_code=postal)
+    except Exception as e:
+        logger.warning("AV validation crashed for %s: %s", item.get("Назва"), e)
+        item["Address Status"] = "⚙️ Error"
+        item["Address Reason"] = f"crash:{type(e).__name__}"
+        return
+
+    item["Address Status"] = result.status_emoji
+    item["Address Reason"] = result.reason
+    item["Place ID"] = result.place_id or ""
+    item["Formatted Address"] = result.formatted
+
+    # Інкремент лічильників у status_dict — для фінального summary
+    s = result.status
+    if s == "OK":
+        status_dict["av_ok"] = status_dict.get("av_ok", 0) + 1
+    elif s == "Risk":
+        status_dict["av_risk"] = status_dict.get("av_risk", 0) + 1
+    elif s == "Bad":
+        status_dict["av_bad"] = status_dict.get("av_bad", 0) + 1
+    else:
+        status_dict["av_skipped"] = status_dict.get("av_skipped", 0) + 1
+    if result.cached:
+        status_dict["av_cached"] = status_dict.get("av_cached", 0) + 1
+
+
+def _persist_result(item: dict, site_key: str, collected_data: list[dict],
+                    status_dict: dict | None = None) -> None:
     """
     Зберігає один результат у базу + Google Sheets (якщо не дублікат).
     Єдина точка збереження замість 6 однакових блоків у run_scraping.
+
+    Якщо status_dict["validate_address"] == True — додатково перевіряє
+    адресу через Google Address Validation API.
     """
     name = item.get("Назва")
     link_key = _get_link_key(item)
@@ -516,12 +761,18 @@ def _persist_result(item: dict, site_key: str, collected_data: List[dict]) -> No
     # Sheets — через чергу: послідовно, з паузою, гарантовано дійде
     _enqueue_sheet_write(name, link, site_key)
 
+    # ── Перевірка адреси (якщо увімкнено) ──
+    # Викликається ПІСЛЯ збереження в БД — щоб у разі краху валідатора
+    # сама компанія все одно зберіглась.
+    if status_dict and status_dict.get("validate_address"):
+        _validate_address_for_item(item, site_key, status_dict)
+
     collected_data.append(item)
 
 
 def _run_simple_scraper(scraper_fn, args_builder, page, keyword: str,
                         max_count: int, site_key: str, status_dict: dict,
-                        chat_id: int, collected_data: List[dict], file_format: str) -> bool:
+                        chat_id: int, collected_data: list[dict], file_format: str) -> bool:
     """
     Запускає скрапер (підтримує кілька ключових слів через кому).
     Повертає True — сигнал для run_scraping завершити роботу.
@@ -553,7 +804,7 @@ def _run_simple_scraper(scraper_fn, args_builder, page, keyword: str,
                 break
             if not status_dict.get('is_running', True):
                 break
-            _persist_result(item, site_key, collected_data)
+            _persist_result(item, site_key, collected_data, status_dict=status_dict)
 
         # ── Оновлюємо загальний лічильник після кожного ключового слова ──
         # (scrapers оновлюють status_dict["current"] своїм per-keyword counter,
@@ -577,7 +828,7 @@ def _format_excel(tmp_path: str) -> None:
     """Форматує Excel-файл: кольоровий заголовок, авто-ширина, фільтр, зебра."""
     try:
         import openpyxl
-        from openpyxl.styles import PatternFill, Font, Alignment
+        from openpyxl.styles import Alignment, Font, PatternFill
         from openpyxl.utils import get_column_letter
 
         wb = openpyxl.load_workbook(tmp_path)
@@ -622,18 +873,61 @@ def _format_excel(tmp_path: str) -> None:
         logger.warning("Помилка форматування Excel: %s", e)
 
 
-def save_scraping_results(chat_id: int, data: List[dict], file_format: str, status_dict: dict) -> None:
-    df = pd.DataFrame(data)
+# Ключі, що використовуються як заголовок блоку (назва компанії) у TXT.
+_TXT_TITLE_KEYS = ("Назва", "Name", "Company Name", "Title")
+
+
+def _format_txt_readable(data: list[dict]) -> str:
+    """Людиночитабельний TXT: кожна компанія — окремий блок 'поле : значення'
+    з вирівнюванням і роздільником. Значно зручніше за TSV, коли є довгі
+    поля (адреса). Формат універсальний — бере ті поля, що є в записі,
+    тож працює для будь-якого скрапера.
+    """
+    if not data:
+        return "Даних не знайдено.\n"
+
+    def clean(v) -> str:
+        # Прибираємо подвійні пробіли/таби/переноси (артефакти джерела),
+        # заразом гарантуємо, що значення не зламає розмітку блоку.
+        return re.sub(r"\s+", " ", str(v)).strip()
+
+    # Ключі в порядку першої появи (зберігаємо порядок полів скрапера).
+    keys: list[str] = []
+    for row in data:
+        for k in row:
+            if k not in keys:
+                keys.append(k)
+
+    title_key = next((k for k in _TXT_TITLE_KEYS if k in keys), keys[0])
+    field_keys = [k for k in keys if k != title_key]
+    pad = max((len(k) for k in field_keys), default=0)
+
+    sep = "─" * 64
+    lines: list[str] = ["═" * 64, f"  Зібрано компаній: {len(data)}", "═" * 64, ""]
+    for i, row in enumerate(data, 1):
+        lines.append(f"#{i}  {clean(row.get(title_key, '')) or '—'}")
+        for k in field_keys:
+            if k in row:
+                lines.append(f"    {k.ljust(pad)} : {clean(row.get(k, ''))}")
+        lines.append(sep)
+    lines.append("")
+    return "\n".join(lines)
+
+
+def save_scraping_results(chat_id: int, data: list[dict], file_format: str, status_dict: dict) -> None:
     ext = {"EXCEL": "xlsx", "JSON": "json"}.get(file_format, "txt")
     tmp_path = os.path.join(tempfile.gettempdir(), f"res_{chat_id}.{ext}")
 
     if file_format == "EXCEL":
-        df.to_excel(tmp_path, index=False, engine="openpyxl")
+        pd.DataFrame(data).to_excel(tmp_path, index=False, engine="openpyxl")
         _format_excel(tmp_path)
     elif file_format == "JSON":
-        df.to_json(tmp_path, orient="records", force_ascii=False, indent=4)
+        pd.DataFrame(data).to_json(tmp_path, orient="records", force_ascii=False, indent=4)
     else:
-        df.to_csv(tmp_path, index=False, sep='\t')
+        # TXT — людиночитабельні блоки (utf-8-sig, щоб кирилиця коректно
+        # відкривалась у Windows Notepad).
+        with open(tmp_path, "w", encoding="utf-8-sig") as f:
+            f.write(_format_txt_readable(data))
 
     status_dict['file_path'] = tmp_path
     logger.info("Файл збережено: %s", tmp_path)
@@ -643,31 +937,35 @@ def run_scraping(chat_id: int, keyword: str, max_count: int,
                  site_key: str, file_format: str, status_dict: dict) -> None:
     database.init_db()
     config = SCRAPER_CONFIG.get(site_key, {})
-    collected_data: List[dict] = []
+    collected_data: list[dict] = []
 
     # ── Таблиця маршрутизації скраперів ──
     # Формат: site_key -> (scraper_fn, args_builder)
     # args_builder(page, keyword, max_count, status_dict) → tuple аргументів
     #
-    # API-скрапери (France, Finland, Latvia, UK) — page=None, браузер не запускається.
-    # Браузерні (California, Denmark, Czech, NZ, Thailand, Turkey) — page=ChromiumPage.
-    SIMPLE_SCRAPERS: Dict[str, Any] = {
+    # API-скрапери (France, Finland, Latvia, UK, Turkey) — page=None, браузер не запускається.
+    # Браузерні (California, Washington, Denmark, Czech, NZ, Thailand) — page=ChromiumPage.
+    SIMPLE_SCRAPERS: dict[str, Any] = {
         # ── API-скрапери (без браузера) ──
         "France":        (scrape_france_api,   lambda p, kw, mc, sd: (kw, mc, sd)),
         "Finland":       (scrape_finland_api,  lambda p, kw, mc, sd: (kw, mc, sd)),
+        "Norway":        (scrape_norway_api,   lambda p, kw, mc, sd: (kw, mc, sd)),
         "Latvia":        (scrape_latvia,        lambda p, kw, mc, sd: (kw, mc, sd)),
+        "India":         (scrape_india_api,     lambda p, kw, mc, sd: (kw, mc, sd)),
         "UnitedKingdom": (scrape_uk_api,        lambda p, kw, mc, sd: (kw, mc, sd)),
+        "Turkey":        (turkey_scraper.scrape_turkey, lambda p, kw, mc, sd: (None, kw, mc, sd)),
         # ── Браузерні скрапери ──
         "California":    (scrape_california,   lambda p, kw, mc, sd: (p, kw, mc, sd)),
+        "Washington":    (scrape_washington,   lambda p, kw, mc, sd: (p, kw, mc, sd)),
         "Denmark":       (scrape_denmark,       lambda p, kw, mc, sd: (p, kw, mc, sd)),
         "CzechRepublic": (scrape_czech,         lambda p, kw, mc, sd: (p, kw, mc, sd)),
         "NewZealand":    (scrape_new_zealand,   lambda p, kw, mc, sd: (p, kw, mc, sd)),
         "Thailand":      (scrape_thailand,      lambda p, kw, mc, sd: (p, kw, mc, sd)),
-        "Turkey":        (turkey_scraper.scrape_turkey, lambda p, kw, mc, sd: (p, kw, mc, sd)),
     }
 
-    # Браузер запускаємо ТІЛЬКИ для скраперів, яким він потрібен
-    BROWSER_BASED: set = {"California", "Denmark", "CzechRepublic", "NewZealand", "Thailand", "Turkey"}
+    # Браузер запускаємо ТІЛЬКИ для скраперів, яким він потрібен.
+    # Turkey раніше був у BROWSER_BASED — тепер ходить через ITO Internal API (aiohttp).
+    BROWSER_BASED: set = {"California", "Washington", "Denmark", "CzechRepublic", "NewZealand", "Thailand"}
     needs_browser = site_key in BROWSER_BASED
 
     page, relay = (None, None)

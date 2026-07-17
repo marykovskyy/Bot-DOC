@@ -11,9 +11,8 @@ from aiohttp import web
 from telegram import Update
 from telegram.ext import ContextTypes
 
-from config import ADMIN_ID
-from state import scraping_status, _status_lock, MAX_PARALLEL_TASKS, _bot_start_time
 from handlers.admin import is_admin, require_auth
+from state import MAX_PARALLEL_TASKS, _bot_start_time, _status_lock, scraping_status
 
 logger = logging.getLogger(__name__)
 
@@ -184,4 +183,5 @@ async def restart_bot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         logger.info("🔄 os.execl → перезапуск процесу")
         os.execl(sys.executable, sys.executable, *sys.argv)
 
-    asyncio.create_task(_restart())
+    from state import create_tracked_task
+    create_tracked_task(_restart())

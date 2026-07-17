@@ -1,8 +1,10 @@
-import os
 import logging
-import requests
+import os
 import time
 from datetime import datetime
+
+import requests
+
 import database
 
 logger = logging.getLogger(__name__)
@@ -84,18 +86,59 @@ def scrape_uk_api(keyword: str, max_count: int, status_dict: dict) -> list[dict]
         status_dict['last_name'] = f"🇬🇧 Шукаю компанії від {target_year} (тільки посилання)..."
         date_dir = None
 
-    try:
-        response = requests.get(
-            "https://api.company-information.service.gov.uk/search/companies",
-            params={"q": keyword, "items_per_page": 100},
-            auth=(str(UK_API_KEY), ''),
-            timeout=30,
-        )
-        if response.status_code != 200:
-            logger.error("UK API відповів %d", response.status_code)
-            return results
+    # ── Пагінація: Companies House search підтримує start_index ──
+    # Раніше бралися лише топ-100 збігів на слово: повторний прогін з тим
+    # самим словом давав 0 (усе вже в базі — "слово вичерпане"). Тепер
+    # гортаємо сторінки далі, доки не набрано max_count або збіги скінчились.
+    _PAGE_SIZE = 100
+    _MAX_PAGES = 10          # захисна межа: до 1000 збігів на ключове слово
 
-        for item in response.json().get('items', []):
+    try:
+        for page_num in range(_MAX_PAGES):
+            if len(results) >= max_count:
+                break
+            if not status_dict.get('is_running', True):
+                break
+
+            start_index = page_num * _PAGE_SIZE
+            response = requests.get(
+                "https://api.company-information.service.gov.uk/search/companies",
+                params={"q": keyword, "items_per_page": _PAGE_SIZE,
+                        "start_index": start_index},
+                auth=(str(UK_API_KEY), ''),
+                timeout=30,
+            )
+            if response.status_code != 200:
+                logger.error("UK API відповів %d (start_index=%d)",
+                             response.status_code, start_index)
+                break
+
+            items = response.json().get('items', [])
+            if not items:
+                logger.info("UK '%s': збіги скінчились на сторінці %d",
+                            keyword, page_num + 1)
+                break
+            if page_num > 0:
+                logger.info("UK '%s': сторінка %d (start_index=%d, зібрано %d/%d)",
+                            keyword, page_num + 1, start_index, len(results), max_count)
+
+            _process_page(items, results, max_count, target_year, status_dict,
+                          do_download, date_dir)
+
+            time.sleep(0.5)   # пауза між сторінками пошуку (rate limit CH: 600 зап./5 хв)
+
+    except Exception as e:
+        logger.error("Помилка UK API: %s", e)
+
+    return results
+
+
+def _process_page(items: list, results: list[dict], max_count: int,
+                  target_year: str, status_dict: dict,
+                  do_download: bool, date_dir: str | None) -> None:
+    """Обробляє одну сторінку пошукових збігів (фільтри + збір документів)."""
+    try:
+        for item in items:
             if len(results) >= max_count:
                 break
             if not status_dict.get('is_running', True):
@@ -190,6 +233,4 @@ def scrape_uk_api(keyword: str, max_count: int, status_dict: dict) -> list[dict]
             time.sleep(_API_RATE_LIMIT_SLEEP)
 
     except Exception as e:
-        logger.error("Помилка UK API: %s", e)
-
-    return results
+        logger.error("Помилка обробки сторінки UK: %s", e)

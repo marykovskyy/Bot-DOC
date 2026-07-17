@@ -7,7 +7,6 @@ import logging
 import random
 import time
 from functools import wraps
-from typing import Tuple, Type
 
 logger = logging.getLogger(__name__)
 
@@ -16,7 +15,7 @@ def with_retry(
     max_retries: int = 3,
     delay: float = 1.5,
     backoff: float = 2.0,
-    exceptions: Tuple[Type[BaseException], ...] = (Exception,),
+    exceptions: tuple[type[BaseException], ...] = (Exception,),
     jitter: float = 0.25,
 ):
     """

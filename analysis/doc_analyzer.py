@@ -15,13 +15,34 @@ from __future__ import annotations
 
 import io
 import os
-import re
+
+# ── Ліміт потоків нативних OCR-бібліотек (МАЄ бути ДО import numpy/onnx/cv2) ──
+# Кожен local_analyze CPU-важкий (Tesseract + RapidOCR/ONNX + OpenCV). Якщо
+# кожен процес хапає всі ядра, то при N паралельних воркерах виникає N×cores
+# потоків, що б'ються за ті самі ядра → кожне фото сповільнюється в рази
+# (замір: 12с → 70с при 15 воркерах → таймаути → хибні NOT_FOUND). Робимо
+# нативні бібліотеки 1-поточними; паралелізм дає семафор рівня воркерів
+# (_local_ocr_semaphore в ai_sorter). Env читаються при import numpy/onnx,
+# тому виставляємо їх ДО цих імпортів.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+
 import logging
 import platform
+import re
 import threading
-import numpy as np
+import time
 from datetime import date, datetime
-from typing import Optional
+
+import numpy as np
+
+# OpenCV обмежуємо в runtime (не через env) — теж не має захоплювати всі ядра.
+try:
+    import cv2 as _cv2
+    _cv2.setNumThreads(1)
+except Exception:
+    pass
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +53,7 @@ logger = logging.getLogger(__name__)
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _DEBUG_LOG_PATH = os.path.join(_PROJECT_ROOT, "analysis_debug.log")
 
-_diag_logger: Optional[logging.Logger] = None
+_diag_logger: logging.Logger | None = None
 _diag_ctx = threading.local()  # thread-local: зберігає client_id поточного потоку
 
 
@@ -161,7 +182,6 @@ def _prepare_image(image_bytes: bytes, max_px: int = 1200):
 
 def _binarize(img):
     """Конвертує в ч/б з порогом для кращого OCR MRZ."""
-    from PIL import Image
     gray = img.convert('L')
     return gray.point(lambda x: 255 if x > 140 else 0, '1')
 
@@ -179,7 +199,7 @@ def _cv2_to_pil(arr: np.ndarray):
     return Image.fromarray(arr[:, :, ::-1], 'RGB')
 
 
-def _apply_clahe(img) -> 'PIL.Image':
+def _apply_clahe(img) -> PIL.Image:
     """CLAHE — Contrast Limited Adaptive Histogram Equalization.
 
     Вирівнює контраст ЛОКАЛЬНО: якщо частина документа в тіні або
@@ -199,13 +219,13 @@ def _apply_clahe(img) -> 'PIL.Image':
         return ImageEnhance.Contrast(img).enhance(1.5)
 
 
-def _sharpen(img) -> 'PIL.Image':
+def _sharpen(img) -> PIL.Image:
     """Підвищує різкість — допомагає з розмитими фото документів."""
     from PIL import ImageFilter
     return img.filter(ImageFilter.SHARPEN)
 
 
-def _adaptive_threshold(img) -> 'PIL.Image':
+def _adaptive_threshold(img) -> PIL.Image:
     """Адаптивна бінаризація — краще за глобальний поріг 140.
 
     Глобальний поріг ламається коли:
@@ -240,7 +260,7 @@ def _adaptive_threshold(img) -> 'PIL.Image':
         return gray.point(lambda x: 255 if x > threshold else 0, '1').convert('RGB')
 
 
-def _denoise(img) -> 'PIL.Image':
+def _denoise(img) -> PIL.Image:
     """Видаляє шум — дрібні артефакти від стиснення JPEG, текстура фону."""
     try:
         import cv2
@@ -255,7 +275,7 @@ def _denoise(img) -> 'PIL.Image':
         return img.filter(ImageFilter.MedianFilter(size=3))
 
 
-def _apply_sauvola(img) -> 'PIL.Image':
+def _apply_sauvola(img) -> PIL.Image:
     """Sauvola бінаризація — адаптивний поріг враховує локальну дисперсію.
 
     Краще за CLAHE + adaptive threshold для документів з:
@@ -267,8 +287,8 @@ def _apply_sauvola(img) -> 'PIL.Image':
     де R=128, k=0.2 — стандартні параметри для друкованого тексту.
     """
     try:
-        from skimage.filters import threshold_sauvola
         from PIL import Image
+        from skimage.filters import threshold_sauvola
         gray = np.array(img.convert('L'))
         thresh = threshold_sauvola(gray, window_size=25, k=0.2)
         binary = ((gray > thresh) * 255).astype(np.uint8)
@@ -278,7 +298,110 @@ def _apply_sauvola(img) -> 'PIL.Image':
         return _adaptive_threshold(img)
 
 
-def _deskew(img) -> 'PIL.Image':
+def _order_corners(pts) -> np.ndarray:
+    """Впорядковує 4 точки: top-left, top-right, bottom-right, bottom-left."""
+    pts = np.array(pts, dtype=np.float32).reshape(4, 2)
+    s = pts.sum(axis=1)
+    d = (pts[:, 0] - pts[:, 1])
+    tl = pts[np.argmin(s)]
+    br = pts[np.argmax(s)]
+    tr = pts[np.argmax(d)]
+    bl = pts[np.argmin(d)]
+    return np.array([tl, tr, br, bl], dtype=np.float32)
+
+
+def _card_quads_from_mask(mask, img_area: float) -> list:
+    """З бінарної маски дістає кандидат-квадрати картки (топ-3 за площею)."""
+    import cv2
+    quads = []
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    for cnt in sorted(contours, key=cv2.contourArea, reverse=True)[:3]:
+        area = cv2.contourArea(cnt)
+        # Картка займає 18-92% кадру: менше — шум, більше — вже заповнює сама.
+        if area < img_area * 0.18 or area > img_area * 0.92:
+            continue
+        peri = cv2.arcLength(cnt, True)
+        approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
+        if len(approx) == 4:
+            quads.append(approx.reshape(4, 2).astype(np.float32))
+        else:
+            quads.append(cv2.boxPoints(cv2.minAreaRect(cnt)).astype(np.float32))
+    return quads
+
+
+def _warp_card(arr, quad):
+    """Перспективне виправлення картки за 4 кутами. None якщо пропорції не карткові."""
+    import cv2
+    pts = _order_corners(quad)
+    tl, tr, br, bl = pts
+    maxW = int(max(np.linalg.norm(br - bl), np.linalg.norm(tr - tl)))
+    maxH = int(max(np.linalg.norm(tr - br), np.linalg.norm(tl - bl)))
+    if maxW < 200 or maxH < 120:
+        return None
+    # ID-1 ~1.58, паспорт ~1.42; відсіюємо «смужки».
+    aspect = max(maxW, maxH) / float(max(1, min(maxW, maxH)))
+    if aspect > 3.2:
+        return None
+    dst = np.array([[0, 0], [maxW - 1, 0], [maxW - 1, maxH - 1], [0, maxH - 1]],
+                   dtype=np.float32)
+    M = cv2.getPerspectiveTransform(pts, dst)
+    return cv2.warpPerspective(arr, M, (maxW, maxH))
+
+
+def _card_crop_candidates(img, max_candidates: int = 3) -> list:
+    """Мульти-стратегійна детекція картки → список кропнутих PIL-зображень.
+
+    Стратегії: Canny-краї, адаптивний поріг, Otsu — кожна ловить свій тип
+    фону/контрасту. Беремо найбільші контури, warp-имо, дедуплікуємо за
+    розміром. Порожній список → fallback нічого не робить (без регресу).
+    """
+    try:
+        import cv2
+        arr = _pil_to_cv2(img)                      # BGR
+        h, w = arr.shape[:2]
+        img_area = float(w * h)
+        gray = cv2.cvtColor(arr, cv2.COLOR_BGR2GRAY)
+        blur = cv2.GaussianBlur(gray, (5, 5), 0)
+        kernel = np.ones((3, 3), np.uint8)
+
+        masks = []
+        # 1) Canny-краї (чіткий контур картки на контрастному фоні)
+        masks.append(cv2.dilate(cv2.Canny(blur, 30, 120), kernel, iterations=2))
+        # 2) Адаптивний поріг (документ світліший/темніший за фон)
+        at = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                   cv2.THRESH_BINARY_INV, 35, 10)
+        masks.append(cv2.morphologyEx(at, cv2.MORPH_CLOSE, kernel, iterations=2))
+        # 3) Otsu (глобальний поріг — рівномірне освітлення)
+        _, ot = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        masks.append(cv2.morphologyEx(ot, cv2.MORPH_CLOSE, kernel, iterations=2))
+
+        quads = []
+        for m in masks:
+            quads.extend(_card_quads_from_mask(m, img_area))
+
+        results, seen = [], []
+        for q in quads:
+            warped = _warp_card(arr, q)
+            if warped is None:
+                continue
+            sh, sw = warped.shape[:2]
+            # Дедуп: пропускаємо схожі за розміром (±8%)
+            if any(abs(sh - s[0]) < s[0] * 0.08 and abs(sw - s[1]) < s[1] * 0.08
+                   for s in seen):
+                continue
+            seen.append((sh, sw))
+            results.append(_cv2_to_pil(warped))
+            if len(results) >= max_candidates:
+                break
+        if results:
+            _diag(f"    [Crop] {len(results)} card candidate(s) from {w}x{h}")
+        return results
+    except Exception as e:
+        logger.debug("_card_crop_candidates error: %s", e)
+        return []
+
+
+def _deskew(img) -> PIL.Image:
     """Виправляє нахил зображення (deskew).
 
     Якщо документ сфотографовано під кутом — текст нахилений,
@@ -342,8 +465,13 @@ def _get_paddle_ocr():
             return _paddle_ocr_instance
         try:
             from rapidocr_onnxruntime import RapidOCR
-            _paddle_ocr_instance = RapidOCR()
-            _diag("  [PaddleOCR] initialized OK (RapidOCR/ONNX)")
+            # 1-поточний ONNX: при паралельних воркерах не даємо одному екземпляру
+            # захопити всі ядра (інакше перепідписка → сповільнення в рази).
+            try:
+                _paddle_ocr_instance = RapidOCR(intra_op_num_threads=1, inter_op_num_threads=1)
+            except TypeError:
+                _paddle_ocr_instance = RapidOCR()
+            _diag("  [PaddleOCR] initialized OK (RapidOCR/ONNX, 1 thread)")
             return _paddle_ocr_instance
         except Exception as e:
             _diag(f"  [PaddleOCR] init FAILED: {e}")
@@ -411,7 +539,7 @@ def _paddle_ocr_data(img) -> list[dict]:
         return []
 
 
-def _preprocess_variants(img) -> list[tuple['PIL.Image', str]]:
+def _preprocess_variants(img) -> list[tuple[PIL.Image, str]]:
     """Генерує кілька варіантів обробки зображення.
 
     Кожен варіант оптимізований під різні умови фото:
@@ -452,19 +580,23 @@ def _preprocess_variants(img) -> list[tuple['PIL.Image', str]]:
 
 # ── MRZ парсинг ─────────────────────────────────────────────────────────
 
-def _mrz_date_to_iso(yymmdd: str) -> Optional[str]:
-    """YYMMDD → YYYY-MM-DD."""
+def _mrz_date_to_iso(yymmdd: str) -> str | None:
+    """YYMMDD → YYYY-MM-DD.
+
+    Це поле EXPIRY: вікно 00-50 → 20xx (паспорти видають на 10 років,
+    тож expiry 2033+ — норма; стара межа <=30 робила з 2033 → 1933).
+    """
     if len(yymmdd) != 6 or not yymmdd.isdigit():
         return None
     yy, mm, dd = int(yymmdd[:2]), int(yymmdd[2:4]), int(yymmdd[4:6])
-    year = 2000 + yy if yy <= 30 else 1900 + yy
+    year = 2000 + yy if yy <= 50 else 1900 + yy
     try:
         return date(year, mm, dd).strftime("%Y-%m-%d")
     except ValueError:
         return None
 
 
-def _extract_expiry_from_mrz(text: str) -> Optional[str]:
+def _extract_expiry_from_mrz(text: str) -> str | None:
     """Витягує expiry date з MRZ-тексту.
     TD3 line2[21:27], TD1 line2[8:14]."""
     text = text.upper()
@@ -488,15 +620,72 @@ def _extract_expiry_from_mrz(text: str) -> Optional[str]:
         elif 28 <= len(cleaned) <= 32:
             mrz_30.append((cleaned + '<' * 30)[:30])
 
-    # TD3 (паспорт): expiry at line2[21:27]
-    if len(mrz_44) >= 2:
-        iso = _mrz_date_to_iso(mrz_44[1][21:27])
+    # TD3 (паспорт): expiry at data-line[21:27].
+    # OCR (особливо RapidOCR) часто віддає рядки У ЗВОРОТНОМУ ПОРЯДКУ або
+    # губить P<-рядок зовсім — тому пробуємо позицію [21:27] на КОЖНОМУ
+    # 44-рядку, а не лише на mrz_44[1]. P<SURNAME-рядки відсіюються самі
+    # (літери на місці дати не парсяться).
+    for line44 in mrz_44:
+        iso = _mrz_date_to_iso(line44[21:27])
         if iso:
             return iso
 
     # TD1 (ID карта): expiry at line2[8:14]
     if len(mrz_30) >= 3:
         iso = _mrz_date_to_iso(mrz_30[1][8:14])
+        if iso:
+            return iso
+
+    # ── TOLERANT fallback (міжнародні ID/паспорти) ──
+    # Якщо OCR пошкодив структуру рядків (з'їв пробіли/символи), шукаємо
+    # expiry за ПОЗИЦІЙНИМ маркером MRZ незалежно від розбиття на рядки:
+    #   DOB(6) check(1) sex(M/F/<) EXPIRY(6) check(1) country(3)
+    iso = _mrz_tolerant_expiry(text)
+    if iso:
+        return iso
+
+    return None
+
+
+# Позиційні паттерни MRZ (толерантні до пошкодженого розбиття рядків):
+# TD1 line2 (ID-карти): DOB(6) chk стать EXPIRY(6) chk КРАЇНА(3) — країна ПІСЛЯ
+_MRZ_TOLERANT_RE = re.compile(r"(\d{6})(\d)([MF<])(\d{6})(\d)([A-Z]{3})")
+# TD3 line2 (паспорти): КРАЇНА(3) DOB(6) chk стать EXPIRY(6) chk — країна ПЕРЕД
+# Приклад: "1240925469GBR7510186M3305304<<<" → GBR 751018 6 M 330530 4
+_MRZ_TD3_TOLERANT_RE = re.compile(r"[A-Z]{3}(\d{6})(\d)([MF<])(\d{6})(\d)")
+
+
+def _mrz_tolerant_expiry(text: str) -> str | None:
+    """Знаходить expiry в MRZ навіть якщо OCR пошкодив розбиття на рядки.
+
+    Шукає позиційні блоки TD1 (DOB+стать+EXPIRY+країна) та TD3
+    (країна+DOB+стать+EXPIRY). Expiry YY: 00-50 → 20xx.
+    Рятує випадки, коли OCR прочитав дата-рядок, але загубив P<-рядок
+    або переплутав порядок рядків.
+    """
+    cleaned = text.upper()
+    for old, new in (('О', 'O'), ('С', 'C'), ('В', 'B'), ('Н', 'H'),
+                     ('{', '<'), ('[', '<'), ('|', '<'), ('(', '<'),
+                     (' ', '')):
+        cleaned = cleaned.replace(old, new)
+
+    def _exp_to_iso(exp_raw: str) -> str | None:
+        try:
+            yy, mm, dd = int(exp_raw[:2]), int(exp_raw[2:4]), int(exp_raw[4:6])
+            year = 2000 + yy if yy <= 50 else 1900 + yy
+            return date(year, mm, dd).strftime("%Y-%m-%d")
+        except (ValueError, IndexError):
+            return None
+
+    m = _MRZ_TOLERANT_RE.search(cleaned)
+    if m:
+        iso = _exp_to_iso(m.group(4))
+        if iso:
+            return iso
+
+    m = _MRZ_TD3_TOLERANT_RE.search(cleaned)
+    if m:
+        iso = _exp_to_iso(m.group(4))
         if iso:
             return iso
 
@@ -540,6 +729,77 @@ _US_ADDRESS_RE = re.compile(
 )
 
 
+# ── Визначення країни документа (ISO-3) ──────────────────────────────────
+
+# ISO-3 коди країн, що зустрічаються в MRZ міжнародних документів
+_ISO3_CODES = {
+    'CHE': 'Switzerland', 'FRA': 'France', 'DEU': 'Germany',
+    'GBR': 'United Kingdom', 'USA': 'United States', 'CAN': 'Canada',
+    'AUS': 'Australia', 'NZL': 'New Zealand', 'ITA': 'Italy',
+    'ESP': 'Spain', 'PRT': 'Portugal', 'NLD': 'Netherlands',
+    'BEL': 'Belgium', 'POL': 'Poland', 'CZE': 'Czechia',
+    'SVK': 'Slovakia', 'HUN': 'Hungary', 'AUT': 'Austria',
+    'DNK': 'Denmark', 'SWE': 'Sweden', 'NOR': 'Norway',
+    'FIN': 'Finland', 'IRL': 'Ireland', 'ROU': 'Romania',
+    'BGR': 'Bulgaria', 'HRV': 'Croatia', 'SVN': 'Slovenia',
+    'EST': 'Estonia', 'LVA': 'Latvia', 'LTU': 'Lithuania',
+    'LUX': 'Luxembourg', 'GRC': 'Greece', 'MEX': 'Mexico',
+    'BRA': 'Brazil', 'ARG': 'Argentina', 'CHL': 'Chile',
+    'JPN': 'Japan', 'KOR': 'South Korea', 'IND': 'India',
+    'MYS': 'Malaysia', 'SGP': 'Singapore', 'ISR': 'Israel',
+    'TUR': 'Turkey', 'UKR': 'Ukraine', 'RUS': 'Russia',
+}
+_ISO3_RE = re.compile(r"\b(" + "|".join(_ISO3_CODES.keys()) + r")\b")
+
+# Назви країн у відкритому тексті → ISO-3
+_COUNTRY_NAME_TO_ISO3 = {
+    'switzerland': 'CHE', 'schweiz': 'CHE', 'suisse': 'CHE', 'svizzera': 'CHE',
+    'france': 'FRA', 'république française': 'FRA', 'republique francaise': 'FRA',
+    'germany': 'DEU', 'deutschland': 'DEU', 'bundesrepublik': 'DEU',
+    'united kingdom': 'GBR', 'great britain': 'GBR',
+    'united states': 'USA',
+    'italia': 'ITA', 'italy': 'ITA', 'repubblica italiana': 'ITA',
+    'españa': 'ESP', 'espana': 'ESP', 'spain': 'ESP',
+    'česká republika': 'CZE', 'ceska republika': 'CZE', 'czech republic': 'CZE',
+    'polska': 'POL', 'poland': 'POL',
+    'nederland': 'NLD', 'netherlands': 'NLD',
+    'österreich': 'AUT', 'osterreich': 'AUT', 'austria': 'AUT',
+    'belgique': 'BEL', 'belgium': 'BEL', 'belgië': 'BEL',
+    'portugal': 'PRT', 'sverige': 'SWE', 'sweden': 'SWE',
+}
+
+
+def _detect_country(text: str) -> str | None:
+    """Визначає 3-літерний ISO-код країни з MRZ або відкритого тексту.
+
+    Returns ISO-3 код (напр. 'CHE') або None.
+    """
+    if not text:
+        return None
+    up = text.upper()
+    # 1) ISO-3 код як окреме слово в тексті/MRZ
+    m = _ISO3_RE.search(up)
+    if m:
+        return m.group(1)
+    # 2) MRZ: код країни приклеєний до типу документа/прізвища.
+    #    напр. "P<CHESURNAME", "IDCHE...", "I<DEU..." → беремо 3 літери після
+    #    префіксу типу документа.
+    m = re.search(r"\b[A-Z]{1,2}<?([A-Z]{3})[A-Z<]", up)
+    if m and m.group(1) in _ISO3_CODES:
+        return m.group(1)
+    # 3) MRZ позиційний блок: ...EXPIRY(6)+check+COUNTRY(3)
+    m = _MRZ_TOLERANT_RE.search(up.replace('О', 'O').replace('С', 'C')
+                                 .replace('В', 'B').replace('Н', 'H'))
+    if m and m.group(6) in _ISO3_CODES:
+        return m.group(6)
+    # 4) Назва країни у відкритому тексті
+    low = text.lower()
+    for name, code in _COUNTRY_NAME_TO_ISO3.items():
+        if name in low:
+            return code
+    return None
+
+
 def _normalize_text(text: str) -> str:
     """Нормалізує текст: curly apostrophes → ASCII, зайві пробіли тощо."""
     # OCR часто повертає curly quotes замість ASCII
@@ -555,6 +815,17 @@ def _detect_date_format(text: str) -> str:
     Returns:
         'us' (MM/DD/YYYY) або 'eu' (DD/MM/YYYY)
     """
+    # 0) Надійно визначена країна має пріоритет над евристиками нижче.
+    #    MM/DD використовують по суті лише США; решта світу — DD/MM. Це виправляє
+    #    IT/FR/DE-документи (напр. 11.04.2029 = 11 квітня, а не 4 листопада).
+    #    US driver license зазвичай не має ISO3/MRZ → _detect_country поверне None
+    #    → падаємо в евристики нижче, тож US-логіка не ламається.
+    _country = _detect_country(text)
+    if _country == 'USA':
+        return 'us'
+    if _country and _country in _ISO3_CODES:
+        return 'eu'
+
     low = _normalize_text(text).lower()
 
     # Шукаємо назви US-штатів (повні)
@@ -601,6 +872,16 @@ def _detect_date_format(text: str) -> str:
 
 # ── Пошук дати за ключовими словами ─────────────────────────────────────
 
+# Скорочення місяців: англ. + фр./іт./ісп./нім./порт. (двомовні паспорти ЄС)
+_MONTH_ABBR = (
+    r'JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC'
+    r'|JANV|FEV|FÉV|AVR|MAI|JUIN|JUIL|AOU|AOÛT|SEPT|DÉC'   # FR (+MAI = DE/NO)
+    r'|GEN|MAG|GIU|LUG|AGO|SET|OTT|DIC'                               # IT
+    r'|ENE|ABR'                                                       # ES
+    r'|MÄR|MRZ|OKT|DEZ'                                          # DE
+    r'|OUT'                                                           # PT
+)
+
 _DATE_PATTERNS = [
     re.compile(r'\b(\d{2})[./\-](\d{2})[./\-](\d{4})\b'),       # DD.MM.YYYY (4-digit year)
     re.compile(r'\b(\d{4})[.\-/](\d{2})[.\-/](\d{2})\b'),       # YYYY-MM-DD
@@ -609,6 +890,18 @@ _DATE_PATTERNS = [
         re.I
     ),
     re.compile(r'\b(\d{2})[./\-](\d{2})[./\-](\d{2})\b'),       # DD.MM.YY (2-digit year!)
+    re.compile(r'\b(\d{2})\s+(\d{2})\s+(\d{2,4})\b'),           # DD MM YY[YY] (Swiss/FR/EU spaces)
+    # Двомовні паспортні дати: "30 MAY/MAI 33", "23MAR/MAR 2026", "26 FEB/FEV16"
+    # OCR часто зліплює пробіли, тому \s* і рік 2 або 4 цифри.
+    re.compile(
+        r'(\d{1,2})\s*(' + _MONTH_ABBR + r')\s*\.?/\s*(' + _MONTH_ABBR + r')\s*\.?\s*(\d{4}|\d{2})(?!\d)',
+        re.I
+    ),
+    # Компактна одномовна: "28Apr27", "28 Apr 27" (2- або 4-значний рік)
+    re.compile(
+        r'(?<![A-Za-z0-9])(\d{1,2})\s*(' + _MONTH_ABBR + r')\s*(\d{4}|\d{2})(?![0-9])',
+        re.I
+    ),
 ]
 
 _EXPIRY_KEYWORDS = [
@@ -619,9 +912,20 @@ _EXPIRY_KEYWORDS = [
     'geldig tot', 'data di scadenza',
     'fecha de caducidad', 'vencimiento',
     'validade', 'data de validade',
-    'platnost', 'datum expirace',
+    'platnost', 'platnost do', 'datum expirace',
     '4b', 'érvényes', 'lejárat',
     'effective',  # Australian DL: "Effective ... Expiry"
+    # ── Розширені міжнародні мітки (EU/CH/інші) ──
+    'valable', 'valable jusqu', "jusqu'au",  # FR: "valable jusqu'au"
+    'data scadenza', 'scadenza',             # IT
+    'válida hasta', 'valida hasta',          # ES
+    'data ważności', 'ważności', 'termin ważności',  # PL
+    'geldig tot',                            # NL
+    'gyldig til', 'giltig till',             # DK/NO/SE
+    'voimassa',                              # FI
+    'identitätskarte', 'carte d',            # CH ID hints
+    'geçerlilik', 'son kullanma',            # TR
+    'действителен до', 'дійсний до',         # RU/UA
 ]
 
 # Ключові слова DOB/ISSUE — дати поруч з ними НЕ є expiry
@@ -655,13 +959,25 @@ _MONTH_MAP = {
     'JUL': 7, 'AUG': 8, 'SEP': 9, 'OCT': 10, 'NOV': 11, 'DEC': 12,
 }
 
+# Розширена мапа: + фр./іт./ісп./нім./порт. скорочення (двомовні паспорти)
+_MONTH_MAP_EXT = {
+    **_MONTH_MAP,
+    'JANV': 1, 'FEV': 2, 'FÉV': 2, 'AVR': 4, 'MAI': 5, 'JUIN': 6,
+    'JUIL': 7, 'AOU': 8, 'AOÛT': 8, 'SEPT': 9, 'DÉC': 12,            # FR (+MAI DE/NO)
+    'GEN': 1, 'MAG': 5, 'GIU': 6, 'LUG': 7, 'AGO': 8, 'SET': 9,
+    'OTT': 10, 'DIC': 12,                                            # IT
+    'ENE': 1, 'ABR': 4,                                              # ES
+    'MÄR': 3, 'MRZ': 3, 'OKT': 10, 'DEZ': 12,                        # DE
+    'OUT': 10,                                                       # PT
+}
+
 
 def _yy_to_yyyy(yy: int) -> int:
     """2-значний рік → 4-значний. 00-50 → 2000-2050, 51-99 → 1951-1999."""
     return 2000 + yy if yy <= 50 else 1900 + yy
 
 
-def _parse_date(match: re.Match, pat_idx: int, fmt: str = 'eu') -> Optional[str]:
+def _parse_date(match: re.Match, pat_idx: int, fmt: str = 'eu') -> str | None:
     """regex match → YYYY-MM-DD.
 
     fmt='us' → MM/DD/YYYY, fmt='eu' → DD/MM/YYYY.
@@ -675,9 +991,7 @@ def _parse_date(match: re.Match, pat_idx: int, fmt: str = 'eu') -> Optional[str]
             a, b, yyyy = int(g[0]), int(g[1]), int(g[2])
             if a > 12 and 1 <= b <= 12:
                 dd, mm = a, b
-            elif b > 12 and 1 <= a <= 12:
-                mm, dd = a, b
-            elif fmt == 'us':
+            elif (b > 12 and 1 <= a <= 12) or fmt == 'us':
                 mm, dd = a, b
             else:
                 dd, mm = a, b
@@ -690,21 +1004,41 @@ def _parse_date(match: re.Match, pat_idx: int, fmt: str = 'eu') -> Optional[str]
             yyyy = _yy_to_yyyy(yy)
             if a > 12 and 1 <= b <= 12:
                 dd, mm = a, b
-            elif b > 12 and 1 <= a <= 12:
-                mm, dd = a, b
-            elif fmt == 'us':
+            elif (b > 12 and 1 <= a <= 12) or fmt == 'us':
                 mm, dd = a, b
             else:
                 dd, mm = a, b
+        elif pat_idx == 4:                   # DD MM YY[YY] (space-separated, Swiss/FR/EU)
+            a, b, c = int(g[0]), int(g[1]), int(g[2])
+            yyyy = c if len(g[2]) == 4 else _yy_to_yyyy(c)
+            if a > 12 and 1 <= b <= 12:
+                dd, mm = a, b
+            elif b > 12 and 1 <= a <= 12:
+                mm, dd = a, b
+            else:
+                dd, mm = a, b           # default EU style для пробільних дат
+        elif pat_idx == 5:                   # DD MON1/MON2 YY[YY] (двомовний паспорт)
+            dd = int(g[0])
+            mm = (_MONTH_MAP_EXT.get(g[1].upper(), 0)
+                  or _MONTH_MAP_EXT.get(g[2].upper(), 0))
+            yyyy = int(g[3]) if len(g[3]) == 4 else _yy_to_yyyy(int(g[3]))
+        elif pat_idx == 6:                   # DDMonYY компактна ("28Apr27")
+            dd = int(g[0])
+            mm = _MONTH_MAP_EXT.get(g[1].upper(), 0)
+            yyyy = int(g[2]) if len(g[2]) == 4 else _yy_to_yyyy(int(g[2]))
         else:
             return None
-        if not (1 <= mm <= 12 and 1 <= dd <= 31 and 1950 <= yyyy <= 2036):
+        # Верхня межа року: поточний + 40. US-ліцензії (напр. Arizona — дійсна
+        # до 65 років власника) і паспорти можуть мати exp за 30-40 років.
+        # Стеля 2036 раніше ХИБНО відкидала валідні дати на кшталт 12/30/2041,
+        # лишаючи тільки issue-дату → документ помилково ставав "не валід".
+        _max_year = date.today().year + 40
+        if not (1 <= mm <= 12 and 1 <= dd <= 31 and 1950 <= yyyy <= _max_year):
             return None
         d = date(yyyy, mm, dd)
         iso = d.strftime("%Y-%m-%d")
         # Фільтр: дати в межах ±1 дня від сьогодні — підозрілий OCR-артефакт
         # (Tesseract іноді "читає" дату з метаданих EXIF або шуму)
-        from datetime import timedelta
         today = date.today()
         if abs((d - today).days) <= 1:
             return None
@@ -713,7 +1047,7 @@ def _parse_date(match: re.Match, pat_idx: int, fmt: str = 'eu') -> Optional[str]
         return None
 
 
-def _find_expiry_in_text(text: str) -> Optional[tuple[str, bool]]:
+def _find_expiry_in_text(text: str) -> tuple[str, bool] | None:
     """Шукає expiry date в тексті за ключовими словами.
     Автоматично визначає US/EU формат дати за назвою штату/країни.
 
@@ -742,7 +1076,7 @@ def _find_expiry_in_text(text: str) -> Optional[tuple[str, bool]]:
                     all_dates.append((iso, li))
 
     if not all_dates:
-        _diag(f"      [_find_expiry] no dates parsed from text")
+        _diag("      [_find_expiry] no dates parsed from text")
         return None
 
     _diag(f"      [_find_expiry] format={fmt}, all_dates={all_dates}")
@@ -901,7 +1235,7 @@ def _find_expiry_in_text(text: str) -> Optional[tuple[str, bool]]:
     if candidates_recent:
         _diag(f"      [P1b] recent near EXP: {candidates_recent} → {max(candidates_recent)}")
         return (max(candidates_recent), True)
-    _diag(f"      [P1b] no recent dates near EXP")
+    _diag("      [P1b] no recent dates near EXP")
 
     # Пріоритет 2: дати поруч із expiry-keywords, тільки МАЙБУТНІ
     candidates = [
@@ -922,7 +1256,7 @@ def _find_expiry_in_text(text: str) -> Optional[tuple[str, bool]]:
         _diag(f"      [Fallback] future date without keyword: {future} → ({max(future)}, False)")
         return (max(future), False)
 
-    _diag(f"      [_find_expiry] no valid date found → None")
+    _diag("      [_find_expiry] no valid date found → None")
     return None
 
 
@@ -947,7 +1281,7 @@ _SPATIAL_ISSUE_ANCHORS = {
 _DATE_WORD_RE = re.compile(r'(\d{1,2})[/.\-](\d{1,2})[/.\-](\d{2,4})')
 
 
-def _spatial_find_expiry(img) -> Optional[str]:
+def _spatial_find_expiry(img) -> str | None:
     """Знаходить expiry date через просторовий аналіз bounding boxes.
 
     Принцип (як у Textract):
@@ -1054,7 +1388,7 @@ def _spatial_find_expiry(img) -> Optional[str]:
     if date_words:
         _diag(f"      [Spatial] dates: {[(w['text'], iso) for w, iso in date_words]}")
     else:
-        _diag(f"      [Spatial] no date words found")
+        _diag("      [Spatial] no date words found")
 
     if not date_words:
         return None
@@ -1130,7 +1464,7 @@ def warmup_paddle_ocr() -> None:
 
 # ── Головна функція ─────────────────────────────────────────────────────
 
-def _vote_dates(dates: list[tuple[str, str]]) -> Optional[str]:
+def _vote_dates(dates: list[tuple[str, str]]) -> str | None:
     """Голосування по знайдених датах від різних OCR движків.
 
     dates: [(date_iso, source_label), ...]
@@ -1187,7 +1521,7 @@ def _vote_dates(dates: list[tuple[str, str]]) -> Optional[str]:
     return dates[0][0]
 
 
-def _date_crop_reocr(img, approx_date: str) -> Optional[str]:
+def _date_crop_reocr(img, approx_date: str) -> str | None:
     """Кропає зону дати і перезапускає OCR з psm 7 для точнішого розпізнавання.
 
     Якщо Tesseract вже знайшов приблизну дату через spatial analysis,
@@ -1246,7 +1580,7 @@ def _date_crop_reocr(img, approx_date: str) -> Optional[str]:
     return None
 
 
-def _try_ocr_on_image(img) -> Optional[str]:
+def _try_ocr_on_image(img, deadline: float | None = None) -> str | None:
     """Пробує знайти expiry date на одному зображенні (без повороту).
 
     Стратегія (з Ensemble voting):
@@ -1258,11 +1592,16 @@ def _try_ocr_on_image(img) -> Optional[str]:
       5. Sauvola + Tesseract fallback
       6. Date crop re-OCR (якщо знайшли приблизну дату — перечитуємо точніше)
 
+    deadline (time.monotonic) — м'який дедлайн: важкі кроки пропускаються,
+    коли часу мало, щоб повернути хоч щось замість таймауту.
     Повертає exp_date_iso або None.
     """
     w, h = img.size
     today_iso = date.today().strftime("%Y-%m-%d")
     all_found: list[str] = []
+
+    def _time_left() -> float:
+        return 999.0 if deadline is None else deadline - time.monotonic()
 
     # ── Крок 0: Deskew (виправлення нахилу) ──
     img = _deskew(img)
@@ -1295,7 +1634,7 @@ def _try_ocr_on_image(img) -> Optional[str]:
             _diag(f"    [Spatial] ✅ FOUND: {tesseract_spatial_date}")
             # FAST PATH: якщо Tesseract spatial знайшов майбутню дату — повертаємо
             if tesseract_spatial_date > today_iso:
-                _diag(f"    [Spatial] future date → RETURN (skip PaddleOCR)")
+                _diag("    [Spatial] future date → RETURN (skip PaddleOCR)")
                 return tesseract_spatial_date
     except Exception as e:
         _diag(f"    [Spatial] error: {e}")
@@ -1309,16 +1648,22 @@ def _try_ocr_on_image(img) -> Optional[str]:
             full_text = _normalize_text(full_text)
             text_preview = full_text.replace('\n', ' | ')[:500]
             _diag(f"    [Text] OCR: {text_preview}")
+            # MRZ на ПОВНОМУ тексті (EU ID/паспорт): надійніше за дату-за-міткою.
+            # Ловить MRZ навіть якщо він не потрапив у crop-зони верх/низ.
+            mrz_full = _extract_expiry_from_mrz(full_text)
+            if mrz_full:
+                _diag(f"    [Text-MRZ] ✅ FOUND: {mrz_full} → RETURN")
+                return mrz_full
             result = _find_expiry_in_text(full_text)
             if result:
                 tesseract_text_date, tesseract_text_kw = result
                 _diag(f"    [Text] date={tesseract_text_date}, kw={tesseract_text_kw}")
                 # FAST PATH: Tesseract text знайшов майбутню дату з keyword
                 if tesseract_text_date > today_iso and tesseract_text_kw:
-                    _diag(f"    [Text] ✅ future + keyword → RETURN (skip PaddleOCR)")
+                    _diag("    [Text] ✅ future + keyword → RETURN (skip PaddleOCR)")
                     return tesseract_text_date
         else:
-            _diag(f"    [Text] OCR returned empty text")
+            _diag("    [Text] OCR returned empty text")
     except Exception as e:
         _diag(f"    [Text] error: {e}")
 
@@ -1327,18 +1672,27 @@ def _try_ocr_on_image(img) -> Optional[str]:
     # або знайшов без keyword (невпевнено) → voting для підтвердження
     paddle_date = None
     paddle_kw = False
+    if _time_left() < 8:
+        _diag(f"    ⏱ {_time_left():.0f}s left → skip Paddle/Sauvola/CLAHE, "
+              f"return best-so-far")
+        return max(all_found) if all_found else None
     try:
         paddle_text = _paddle_ocr_text(img)
         if paddle_text:
             paddle_text = _normalize_text(paddle_text)
             paddle_preview = paddle_text.replace('\n', ' | ')[:300]
             _diag(f"    [Paddle] OCR: {paddle_preview}")
+            # MRZ на повному PaddleOCR-тексті (Paddle часто краще читає дрібний MRZ)
+            mrz_pad = _extract_expiry_from_mrz(paddle_text)
+            if mrz_pad:
+                _diag(f"    [Paddle-MRZ] ✅ FOUND: {mrz_pad} → RETURN")
+                return mrz_pad
             result = _find_expiry_in_text(paddle_text)
             if result:
                 paddle_date, paddle_kw = result
                 _diag(f"    [Paddle] date={paddle_date}, kw={paddle_kw}")
         else:
-            _diag(f"    [Paddle] OCR returned empty text")
+            _diag("    [Paddle] OCR returned empty text")
     except Exception as e:
         _diag(f"    [Paddle] error: {e}")
 
@@ -1364,10 +1718,10 @@ def _try_ocr_on_image(img) -> Optional[str]:
                 _diag(f"    [Ensemble] past date with keyword: {best}")
                 all_found.append(best)
             else:
-                _diag(f"    [Ensemble] past date WITHOUT keyword → IGNORED")
+                _diag("    [Ensemble] past date WITHOUT keyword → IGNORED")
 
     # ── Крок 5: Sauvola бінаризація + Tesseract fallback ──
-    if not all_found:
+    if not all_found and _time_left() >= 6:
         try:
             sauvola_img = _apply_sauvola(img)
             sauvola_text = _ocr_image(sauvola_img, config="--psm 3")
@@ -1380,7 +1734,7 @@ def _try_ocr_on_image(img) -> Optional[str]:
                     exp, has_kw = result
                     _diag(f"    [Sauvola] date={exp}, kw={has_kw}")
                     if exp > today_iso:
-                        _diag(f"    [Sauvola] ✅ FUTURE date → RETURN")
+                        _diag("    [Sauvola] ✅ FUTURE date → RETURN")
                         return exp
                     # Cross-validate: якщо Sauvola знайшла минулу дату,
                     # але ensemble мав майбутню дату з тим самим місяцем-днем
@@ -1394,12 +1748,12 @@ def _try_ocr_on_image(img) -> Optional[str]:
                     if has_kw:
                         all_found.append(exp)
             else:
-                _diag(f"    [Sauvola] OCR returned empty text")
+                _diag("    [Sauvola] OCR returned empty text")
         except Exception as e:
             _diag(f"    [Sauvola] error: {e}")
 
     # ── Крок 6: CLAHE + Sharpen fallback ──
-    if not all_found:
+    if not all_found and _time_left() >= 5:
         try:
             enhanced = _sharpen(_apply_clahe(img))
             clahe_text = _ocr_image(enhanced, config="--psm 3")
@@ -1412,12 +1766,12 @@ def _try_ocr_on_image(img) -> Optional[str]:
                     exp, has_kw = result
                     _diag(f"    [CLAHE] date={exp}, kw={has_kw}")
                     if exp > today_iso:
-                        _diag(f"    [CLAHE] ✅ FUTURE date → RETURN")
+                        _diag("    [CLAHE] ✅ FUTURE date → RETURN")
                         return exp
                     if has_kw:
                         all_found.append(exp)
             else:
-                _diag(f"    [CLAHE] OCR returned empty text")
+                _diag("    [CLAHE] OCR returned empty text")
         except Exception as e:
             _diag(f"    [CLAHE] error: {e}")
 
@@ -1425,7 +1779,7 @@ def _try_ocr_on_image(img) -> Optional[str]:
     # DateCrop уточнює дату тільки якщо результат близький до оригіналу
     # (той самий рік і місяць, або різниця ≤ 45 днів).
     # Якщо DateCrop видає дико іншу дату — це сміття, ігноруємо.
-    if all_found:
+    if all_found and _time_left() >= 4:
         try:
             original = all_found[-1]
             re_date = _date_crop_reocr(img, original)
@@ -1452,11 +1806,55 @@ def _try_ocr_on_image(img) -> Optional[str]:
         _diag(f"    [Result] best from candidates: {best}")
         return best
 
-    _diag(f"    [Result] no date found on this orientation")
+    _diag("    [Result] no date found on this orientation")
     return None
 
 
-def local_analyze(image_bytes: bytes, client_id: str = "") -> dict:
+# ── Німецькі права без терміну дії (поле 4b порожнє) ──────────────────────
+# Старі DE-права (видані до 2013) НЕ мають друкованої дати закінчення — вони
+# чинні до поетапних дедлайнів обміну ЄС. OCR правильно не знаходить дату, тож
+# такі документи раніше летіли в «Невизначені». Детектуємо їх окремо, щоб
+# винести в папку «ручна перевірка» (рішення юзера — дату з 4a не вгадуємо).
+_DE_LICENSE_MARKERS = (
+    "FUHRERSCHEIN", "HRERSCHEIN", "UHRERSCH",
+    "BUNDESREPUB", "DEUTSCHLAN", "FAHRERLAUBNIS",
+)
+
+
+def _is_german_license(text: str) -> bool:
+    """Нечітко визначає, чи текст — з німецького посвідчення водія.
+
+    Толерантно до спотвореного OCR: або словниковий маркер (навіть частковий),
+    або одночасна наявність полів 4a. (видача) і 4c. (орган) — вони унікальні
+    для DE-прав і виживають навіть при поганому розпізнаванні.
+    """
+    if not text:
+        return False
+    up = text.upper().replace("Ü", "U")
+    if any(w in up for w in _DE_LICENSE_MARKERS):
+        return True
+    return bool(re.search(r"4\s*A[.\s)]", up) and re.search(r"4\s*C[.\s)]", up))
+
+
+def quick_german_license_check(image_bytes: bytes) -> bool:
+    """Швидка (1 OCR-прохід) перевірка, чи фото — нім. посвідчення водія.
+
+    Викликається ai_sorter'ом окремо від local_analyze, коли той не дав дати
+    або впав у таймаут: повний пайплайн на «глухих» фото часто не встигає дійти
+    до детекції. Тут — один дешевий Tesseract-прохід на зменшеному зображенні.
+    """
+    if not _tesseract_available():
+        return False
+    try:
+        img = _prepare_image(image_bytes)
+        txt = _ocr_image(img, config="--psm 3")
+        return _is_german_license(_normalize_text(txt))
+    except Exception:
+        return False
+
+
+def local_analyze(image_bytes: bytes, client_id: str = "",
+                  time_budget: float = 40.0) -> dict:
     """
     Швидкий локальний аналіз документа через Tesseract.
 
@@ -1487,38 +1885,64 @@ def local_analyze(image_bytes: bytes, client_id: str = "") -> dict:
     _diag(f"  Image size: {img.size[0]}×{img.size[1]}")
     today_iso = date.today().strftime("%Y-%m-%d")
 
-    # Збираємо результати з орієнтацій, з EARLY EXIT
-    candidates: list[tuple[str, str]] = []   # (exp_date, source)
+    # ── М'який бюджет часу ──
+    # Раніше: зовнішній asyncio.wait_for(45с) ВБИВАВ аналіз разом із уже
+    # знайденими кандидатами (замір 08.07: 66/69 «Невизначених» — таймаути,
+    # у 61 з них дата БУЛА знайдена, але результат викинуто). Тепер пайплайн
+    # сам стежить за дедлайном: пропускає важкі кроки/орієнтації, коли час
+    # закінчується, і ПОВЕРТАЄ краще зі знайденого замість нічого.
+    deadline = time.monotonic() + time_budget
 
-    # PIL rotate — counter-clockwise. Покриваємо всі 4 орієнтації:
-    #   0°    — оригінал (правильна орієнтація)
-    #   180°  — перевернуте вгору ногами
-    #   270°  — документ знятий «наліво» (треба повернути CCW 270°, еквівалент 90° CW)
-    #   90°   — документ знятий «направо» (треба повернути CCW 90°, еквівалент 270° CW)
-    orientations = [
-        (img,                               "Local OCR"),
-        (img.rotate(180, expand=False),     "Local OCR (180°)"),
-        (img.rotate(270, expand=True),      "Local OCR (90° CW)"),
-        (img.rotate(90,  expand=True),      "Local OCR (270° CW)"),
-    ]
+    def _run_orientations(base) -> list[tuple[str, str]]:
+        """OCR по 4 орієнтаціях (0/180/90CW/270CW) з early-exit на майбутній даті."""
+        oris = [
+            (base,                           "Local OCR"),
+            (base.rotate(180, expand=False), "Local OCR (180°)"),
+            (base.rotate(270, expand=True),  "Local OCR (90° CW)"),
+            (base.rotate(90,  expand=True),  "Local OCR (270° CW)"),
+        ]
+        found: list[tuple[str, str]] = []
+        for rotated_img, source_label in oris:
+            time_left = deadline - time.monotonic()
+            if time_left < 5:
+                _diag(f"  ⏱ time budget: {time_left:.0f}s left → skip remaining "
+                      f"orientations (return {len(found)} candidate(s))")
+                break
+            _diag(f"  --- Orientation: {source_label} (time left {time_left:.0f}s) ---")
+            try:
+                exp = _try_ocr_on_image(rotated_img, deadline=deadline)
+                if exp:
+                    found.append((exp, source_label))
+                    _diag(f"  → candidate: {exp}")
+                    if exp > today_iso:
+                        _diag("  ⚡ EARLY EXIT: future date found")
+                        break
+                else:
+                    _diag("  → no date on this orientation")
+            except Exception as e:
+                _diag(f"  → error: {e}")
+        return found
 
-    for rotated_img, source_label in orientations:
-        _diag(f"  --- Orientation: {source_label} ---")
-        try:
-            exp = _try_ocr_on_image(rotated_img)
-            if exp:
-                candidates.append((exp, source_label))
-                _diag(f"  → candidate: {exp}")
-                if exp > today_iso:
-                    _diag(f"  ⚡ EARLY EXIT: future date found")
-                    break
-            else:
-                _diag(f"  → no date on this orientation")
-        except Exception as e:
-            _diag(f"  → error: {e}")
+    # 1) Спершу аналізуємо ОРИГІНАЛ — перевірена поведінка, без ризику регресу.
+    candidates = _run_orientations(img)
+
+    # 2) Fallback: якщо дат не знайдено — пробуємо кропнути картку (кілька
+    #    стратегій детекції), прибравши фон/решітку/відблиски. Беремо перший
+    #    кандидат, що дав дату. Суто additive: оригінал уже не дав нічого,
+    #    тож гірше зробити неможливо.
+    if not candidates and deadline - time.monotonic() >= 10:
+        for ci, cropped in enumerate(_card_crop_candidates(img, max_candidates=1), 1):
+            _diag(f"  [Crop-fallback] try candidate #{ci} {cropped.size}")
+            candidates = _run_orientations(cropped)
+            if candidates:
+                img = cropped   # для подальшого визначення країни
+                break
 
     if not candidates:
-        _diag(f"  FINAL: no dates found → None (will go to Textract)")
+        # Дати нема. Детекцію нім. прав без терміну НЕ робимо тут: ці «глухі» фото
+        # часто впираються в 45с таймаут ще до цього місця. Замість цього ai_sorter
+        # викликає quick_german_license_check() окремо (з власним коротким лімітом).
+        _diag("  FINAL: no dates found → None")
         return result
 
     # Вибираємо найкращу дату
@@ -1535,7 +1959,148 @@ def local_analyze(image_bytes: bytes, client_id: str = "") -> dict:
 
     result["exp_date"] = best[0]
     result["source"] = best[1]
+
+    # ── Визначаємо країну документа (для міжнародних док.) ──
+    # Один швидкий текстовий OCR-прохід на оригінальній орієнтації.
+    try:
+        country_text = _ocr_image(img, config="--psm 3")
+        if country_text:
+            ct = _detect_country(_normalize_text(country_text))
+            if not ct:
+                # друга спроба — PaddleOCR (краще читає латиницю на ID)
+                ct = _detect_country(_normalize_text(_paddle_ocr_text(img)))
+            if ct:
+                result["country"] = ct
+                _diag(f"  Country detected: {ct}")
+    except Exception as e:
+        _diag(f"  Country detection error: {e}")
+
     return result
+
+
+# ── Класифікація сторони документа (front / back) ─────────────────────
+# Безкоштовно, тільки OCR. Сигнали (емпірично підтверджено на UK/DE/CA/FR):
+#   BACK  — таблиця категорій водійського (AM/A1/B1/C1/D1/BE/CE/DE), 'fkq',
+#           підписи "Codes/Valid to/Issued by/Category".
+#   FRONT — заголовки документа (DRIVING LICENCE/PASSPORT/PERSONALAUSWEIS...),
+#           іменні поля (Surname/Given/DOB), коди полів 4a-4d,
+#           паспортний MRZ (рядок з P< на дата-сторінці).
+_SIDE_CAT_CODES = ('AM', 'A1', 'A2', 'B1', 'C1E', 'C1', 'D1E', 'D1', 'BE', 'CE', 'DE')
+_SIDE_FRONT_HEADERS = (
+    'DRIVING LICENCE', 'DRIVER LICENSE', 'DRIVERS LICENSE', 'PERMIS DE CONDUIRE',
+    'FUHRERSCHEIN', 'PASSPORT', 'PASSEPORT', 'REISEPASS', 'PERSONALAUSWEIS',
+    'IDENTITY CARD', 'CARTE NATIONALE', 'REPUBLIQUE', 'BUNDESREPUBLIK',
+    'CANADA', 'PASAPORTE',
+)
+_SIDE_FRONT_FIELDS = ('SURNAME', 'GIVEN NAME', 'DATE OF BIRTH', 'NATIONALITY',
+                      '4A', '4B', '4C', '4D')
+_SIDE_BACK_FIELDS = ('CODES', 'VALID TO', 'ISSUED BY', 'CATEGOR', 'FKQ', 'CODE 12')
+
+
+# ── Детектор обличчя (портрет лицьової сторони) ───────────────────────
+_FACE_CASCADE = None
+
+
+def _get_face_cascade():
+    """Lazy-кеш Haar-каскаду облич (йде в комплекті з opencv, без завантажень)."""
+    global _FACE_CASCADE
+    if _FACE_CASCADE is None:
+        import cv2
+        _FACE_CASCADE = cv2.CascadeClassifier(
+            os.path.join(cv2.data.haarcascades, 'haarcascade_frontalface_default.xml'))
+    return _FACE_CASCADE
+
+
+def _has_large_face(img) -> bool:
+    """True якщо є ВЕЛИКИЙ портрет — надійна ознака лицьової сторони.
+
+    Поріг minSize ≈18% картки відсікає дрібний «привид-фото» на звороті ID.
+    Пробує 4 орієнтації (фото може бути повернуте).
+    """
+    try:
+        import cv2
+        casc = _get_face_cascade()
+        if casc.empty():
+            return False
+        arr = _pil_to_cv2(img)
+        h, w = arr.shape[:2]
+        ms = int(min(h, w) * 0.18)
+        for rot in (None, cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_180,
+                    cv2.ROTATE_90_COUNTERCLOCKWISE):
+            a = arr if rot is None else cv2.rotate(arr, rot)
+            gray = cv2.cvtColor(a, cv2.COLOR_BGR2GRAY)
+            if len(casc.detectMultiScale(gray, 1.1, 6, minSize=(ms, ms))) > 0:
+                return True
+        return False
+    except Exception as e:
+        logger.debug("_has_large_face error: %s", e)
+        return False
+
+
+def _side_score(up: str) -> tuple[int, int]:
+    """(front_score, back_score) для нормалізованого ВЕРХНЬОГО тексту."""
+    cats = sum(1 for c in _SIDE_CAT_CODES if re.search(r'\b' + re.escape(c) + r'\b', up))
+    fkq = 1 if re.search(r'\bFKQ\b', up) else 0
+    back = cats + fkq * 4 + sum(2 for m in _SIDE_BACK_FIELDS if m in up)
+    front = (sum(3 for h in _SIDE_FRONT_HEADERS if h in up)
+             + sum(1 for f in _SIDE_FRONT_FIELDS if f in up))
+    mrz_lines = [ln for ln in up.split('\n') if ln.count('<') >= 4]
+    if any(ln.replace(' ', '').startswith(('P<', 'PK', 'PM')) for ln in mrz_lines):
+        front += 4   # паспортний MRZ TD3 (2 рядки) → дата-сторінка = front
+    elif len(mrz_lines) >= 2:
+        back += 5    # MRZ TD1 (3 рядки) — на звороті ID-картки
+    return front, back
+
+
+def detect_side(image_bytes: bytes) -> str:
+    """Визначає сторону документа: 'front' | 'back' | 'unknown'.
+
+    Безкоштовно (локальний OCR + детекція обличчя). Сигнали:
+      FRONT — великий портрет (обличчя), заголовки документа, іменні поля,
+              паспортний MRZ (TD3).
+      BACK  — таблиця категорій водійського, MRZ TD1 (3 рядки), back-поля.
+    Для чистоти сигналів спершу кропить картку; пробує 4 орієнтації.
+    """
+    if not _tesseract_available():
+        return 'unknown'
+    try:
+        img = _prepare_image(image_bytes)
+    except Exception:
+        return 'unknown'
+
+    # ── ШВИДКИЙ ШЛЯХ: велике обличчя = надійний сигнал лицьової ──
+    # Працює на повному фото (без кропу). Driver-license/ID-зворот облич не
+    # має; дрібний «привид» на звороті відсікає поріг minSize. Для більшості
+    # лиць тут і завершуємо — БЕЗ важкого OCR (це різко прискорює масові прогони).
+    if _has_large_face(img):
+        return 'front'
+
+    # ── Без обличчя → ймовірно зворот/нечітко. Легкий OCR (early-exit) ──
+    # для таблиці категорій водійського / MRZ-TD1 / заголовків. Без кропу.
+    best_front = best_back = 0
+    best_signal = -1
+    for angle in (0, 180, 270, 90):
+        try:
+            rimg = img if angle == 0 else img.rotate(angle, expand=True)
+            up = _normalize_text(_ocr_image(rimg, '--psm 3')).upper()
+        except Exception:
+            continue
+        fr, bk = _side_score(up)
+        if fr + bk > best_signal:
+            best_signal, best_front, best_back = fr + bk, fr, bk
+        if best_signal >= 6:
+            break
+
+    front, back = best_front, best_back
+    if back >= 4 and back > front:
+        return 'back'
+    if front >= 3 and front > back:
+        return 'front'
+    if back > front and back >= 2:
+        return 'back'
+    if front > back and front >= 1:
+        return 'front'
+    return 'unknown'
 
 
 # ── API для handlers/analysis.py (/checkdoc команда) ──────────────────
@@ -1560,9 +2125,16 @@ def format_report(result: dict) -> str:
     valid = result.get("is_valid", False)
     status = "✅ Дійсний" if valid else "❌ Прострочений або не визначено"
 
+    country = result.get("country")
+    country_line = ""
+    if country:
+        name = _ISO3_CODES.get(country, country)
+        country_line = f"🌍 Країна: {country} ({name})\n"
+
     return (
         f"📋 **Результат аналізу документа**\n\n"
         f"📅 Дійсний до: `{exp}`\n"
+        f"{country_line}"
         f"📌 Статус: {status}\n"
         f"🔍 Розпізнав: {src}\n"
     )

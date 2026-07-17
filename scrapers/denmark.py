@@ -1,5 +1,6 @@
 import json
 import logging
+
 import database
 
 logger = logging.getLogger(__name__)
@@ -101,11 +102,23 @@ def scrape_denmark(page, keyword: str, count: int, status: dict) -> list[dict]:
             link = f"https://datacvr.virk.dk/enhed/virksomhed/{cvr}"
             status['last_name'] = f"📄 {name}"
 
+            # ── Адреса (для перевірки на Maps) ──
+            # CVR API повертає компоненти окремо: vejnavn (вулиця),
+            # husnummerFra (номер), postnummer, postdistrikt (місто).
+            street_name = str(item.get('vejnavn', '') or '').strip()
+            house_no = str(item.get('husnummerFra', '') or '').strip()
+            postal = str(item.get('postnummer', '') or '').strip()
+            city_dk = str(item.get('postdistrikt', '') or '').strip()
+            full_street = f"{street_name} {house_no}".strip()
+
             results.append({
                 "Назва": name,
                 "Статус": comp_status,
                 "CVR (Номер)": cvr,
-                "Посилання": link
+                "Адреса": full_street,
+                "Місто": city_dk,
+                "Поштовий індекс": postal,
+                "Посилання": link,
             })
             logger.info("[%d] %s (CVR: %s)", len(results), name, cvr)
 
